@@ -120,12 +120,17 @@ function copyDirRecursive(srcDir, destDir) {
 }
 
 /**
- * Materializes only enabled, capability-approved skill snapshots as a LOCAL
- * PLUGIN under `${sessionWorkspaceDir}` (a `.claude-plugin/plugin.json`
- * manifest plus a `skills/` subdirectory holding the same per-skill copies
- * this module always made) and returns the SDK query() option fragments
- * group 3's session builder needs, plus the plugin's own absolute path for
- * host/agent/tools/query-options.js's `plugins` option.
+ * Shared plugin-materialization loop: copies each of `skillEntries` (catalog-
+ * shaped objects — {name, snapshotId, userInvocable, modelInvocable, ...})
+ * into a LOCAL PLUGIN under `${sessionWorkspaceDir}` (a
+ * `.claude-plugin/plugin.json` manifest plus a `skills/` subdirectory) and
+ * returns the SDK query() option fragments this materialization produces.
+ * Used by both `buildSessionSkills()` (a fresh binding, `skillEntries` from
+ * the LIVE catalog) and `materializePluginFromCatalogSnapshot()` (a backfill
+ * for an existing binding, `skillEntries` from that binding's OWN already-
+ * pinned `catalogSnapshot` — never the live catalog; see that function's own
+ * docstring for why that distinction is what keeps a backfill from being a
+ * refresh).
  *
  * `allowedSkillNames` maps to the SDK's `skills` query() option (the real
  * enable/disable gate - "unlisted skills are hidden from the model's
@@ -146,6 +151,52 @@ function copyDirRecursive(srcDir, destDir) {
  * their files remain on disk and are reachable via Read/Bash" - exactly why
  * this module copies only approved snapshots into the session's own plugin
  * directory in the first place, rather than trusting the SDK option alone.
+ */
+function materializeSkillsPlugin(sessionWorkspaceDir, skillEntries) {
+  const pluginDir = path.join(sessionWorkspaceDir, "skills-plugin");
+  const skillsDir = path.join(pluginDir, "skills");
+  fs.mkdirSync(skillsDir, { recursive: true });
+  writePluginManifest(pluginDir);
+
+  const allowedSkillNames = [];
+  const catalogSnapshot = [];
+  const skillOverrides = {};
+  for (const skill of skillEntries) {
+    const src = snapshotDir(skill.snapshotId);
+    if (!fs.existsSync(src)) {
+      // Catalog says enabled but the on-disk snapshot is missing (e.g. the
+      // snapshot directory was deleted out from under the catalog). Skip
+      // rather than fail the whole session - the skill simply will not be
+      // available in this run, and it will not appear in allowedSkillNames
+      // or catalogSnapshot, so assertSlashDispatchAllowed correctly treats
+      // it as unknown.
+      continue;
+    }
+    // The PHYSICAL directory name stays bare (skill.name) - qualification is
+    // an SDK-facing canonical-naming concept, not a filesystem one, and the
+    // plugin's own `name` (from writePluginManifest above) is what supplies
+    // the qualifying prefix when the SDK reports this skill.
+    const dest = path.join(skillsDir, skill.name);
+    copyDirRecursive(src, dest);
+    const qualifiedName = qualifiedSkillName(skill.name);
+    allowedSkillNames.push(qualifiedName);
+    skillOverrides[qualifiedName] = toSkillOverrideValue(skill.userInvocable, skill.modelInvocable);
+    // Deep-cloned so a later in-memory mutation of the live catalog (or of
+    // the caller's own input array) can never retroactively change what this
+    // already-built session believes its bound snapshot looked like.
+    catalogSnapshot.push(JSON.parse(JSON.stringify(skill)));
+  }
+
+  return { pluginDir, skillsDir, allowedSkillNames, catalogSnapshot, skillOverrides };
+}
+
+/**
+ * Materializes only enabled, capability-approved skill snapshots as a LOCAL
+ * PLUGIN under `${sessionWorkspaceDir}` and returns the SDK query() option
+ * fragments group 3's session builder needs, plus the plugin's own absolute
+ * path for host/agent/tools/query-options.js's `plugins` option. See
+ * `materializeSkillsPlugin()` above for the shared copy/qualify logic this
+ * delegates to.
  *
  * Also materializes this session's own isolated Claude Code CLI config
  * directory (`configDir`, `${sessionWorkspaceDir}/claude-config/`) and
@@ -175,48 +226,58 @@ export async function buildSessionSkills(sessionWorkspaceDir) {
     (s) => s.enabled === true && (!s.unsupportedCapabilities || s.unsupportedCapabilities.length === 0)
   );
 
-  const pluginDir = path.join(sessionWorkspaceDir, "skills-plugin");
-  const skillsDir = path.join(pluginDir, "skills");
-  fs.mkdirSync(skillsDir, { recursive: true });
-  writePluginManifest(pluginDir);
+  const { pluginDir, skillsDir, allowedSkillNames, catalogSnapshot, skillOverrides } = materializeSkillsPlugin(
+    sessionWorkspaceDir,
+    approved
+  );
 
   // This session's own isolated Claude Code CLI config directory — see the
-  // docstring above. Created eagerly (mirroring skillsDir just above) so it
+  // docstring above. Created eagerly (mirroring the plugin dir above) so it
   // always exists by the time buildIsolatedOptions() reads it, even for a
   // session with zero approved skills.
   const configDir = path.join(sessionWorkspaceDir, "claude-config");
   fs.mkdirSync(configDir, { recursive: true });
 
-  const allowedSkillNames = [];
-  const catalogSnapshot = [];
-  const skillOverrides = {};
-  for (const skill of approved) {
-    const src = snapshotDir(skill.snapshotId);
-    if (!fs.existsSync(src)) {
-      // Catalog says enabled but the on-disk snapshot is missing (e.g. the
-      // snapshot directory was deleted out from under the catalog). Skip
-      // rather than fail the whole session - the skill simply will not be
-      // available in this run, and it will not appear in allowedSkillNames
-      // or catalogSnapshot, so assertSlashDispatchAllowed correctly treats
-      // it as unknown.
-      continue;
-    }
-    // The PHYSICAL directory name stays bare (skill.name) - qualification is
-    // an SDK-facing canonical-naming concept, not a filesystem one, and the
-    // plugin's own `name` (from writePluginManifest above) is what supplies
-    // the qualifying prefix when the SDK reports this skill.
-    const dest = path.join(skillsDir, skill.name);
-    copyDirRecursive(src, dest);
-    const qualifiedName = qualifiedSkillName(skill.name);
-    allowedSkillNames.push(qualifiedName);
-    skillOverrides[qualifiedName] = toSkillOverrideValue(skill.userInvocable, skill.modelInvocable);
-    // Deep-cloned so a later in-memory mutation of the live catalog can
-    // never retroactively change what this already-built session believes
-    // its bound snapshot looked like.
-    catalogSnapshot.push(JSON.parse(JSON.stringify(skill)));
-  }
-
   return { skillsDir, pluginDir, configDir, allowedSkillNames, catalogSnapshot, skillOverrides };
+}
+
+/**
+ * Backfill path for a skills binding persisted before plugin materialization
+ * existed at all (no `pluginDir` on the persisted binding — see
+ * host/agent/companion.js's `_bindSkillsForRun()`, and this change's own
+ * conversation-metadata census: real, already-persisted conversations on
+ * disk with this exact pre-plugin shape). Rebuilds the plugin directory from
+ * the binding's OWN already-pinned `catalogSnapshot` — deliberately NEVER
+ * calls `listCatalog()` itself, unlike `buildSessionSkills()` above. That is
+ * what makes this a backfill of already-recorded data rather than a refresh
+ * against the live catalog store: it recreates on disk the exact same frozen
+ * selection this conversation was already bound to, it does not pick a new
+ * one — preserving the "a refresh during an active run leaves that run on
+ * its existing snapshot" guarantee `buildSessionSkills()`'s own file header
+ * documents. A skill snapshot that no longer exists on disk is skipped,
+ * exactly like a fresh `buildSessionSkills()` call already tolerates.
+ *
+ * Returns fresh `pluginDir`/`skillsDir`/`allowedSkillNames`/`skillOverrides`
+ * — the caller must overwrite the binding's own copies of all four fields
+ * with these (never just add `pluginDir` alongside the OLD, unqualified
+ * `allowedSkillNames`/`skillOverrides`/`skillsDir`: those were computed
+ * before plugin-qualification existed and would silently mismatch what the
+ * SDK now reports once this skill is loaded through a plugin — see
+ * `materializeSkillsPlugin()`'s own docstring on why the qualified form is
+ * required). `catalogSnapshot` itself is untouched by the caller — it is not
+ * returned here because it does not change.
+ *
+ * @param {string} sessionWorkspaceDir - the binding's own `cwd`.
+ * @param {object[]} catalogSnapshot - the binding's own already-pinned
+ *   `catalogSnapshot` (never the live catalog).
+ * @returns {{ pluginDir: string, skillsDir: string, allowedSkillNames: string[], skillOverrides: Record<string, string> }}
+ */
+export function materializePluginFromCatalogSnapshot(sessionWorkspaceDir, catalogSnapshot) {
+  const { pluginDir, skillsDir, allowedSkillNames, skillOverrides } = materializeSkillsPlugin(
+    sessionWorkspaceDir,
+    Array.isArray(catalogSnapshot) ? catalogSnapshot : []
+  );
+  return { pluginDir, skillsDir, allowedSkillNames, skillOverrides };
 }
 
 /**

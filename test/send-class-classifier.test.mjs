@@ -62,7 +62,13 @@ function fakeSnapshot() {
   return { model: "claude-x", env: { ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "https://x" } };
 }
 function fakeSkills() {
-  return { cwd: "/scratch/send-class-test", configDir: "/scratch/send-class-test/claude-config", allowedSkillNames: [], skillOverrides: {} };
+  return {
+    cwd: "/scratch/send-class-test",
+    configDir: "/scratch/send-class-test/claude-config",
+    pluginDir: "/scratch/send-class-test/skills-plugin",
+    allowedSkillNames: [],
+    skillOverrides: {}
+  };
 }
 
 console.log("\nTask 9.1 — send/submit-class classifier\n");

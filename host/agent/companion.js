@@ -70,6 +70,7 @@ import { buildIsolatedOptions, resolveProfileSnapshot, ProfileUnavailableError }
 import { buildEnhancePrompt, parseEnhanced, buildEnhanceOptions } from "./enhance-prompt.js";
 import {
   buildSessionSkills,
+  materializePluginFromCatalogSnapshot,
   assertSlashDispatchAllowed,
   assertResumeSnapshotAvailable,
   buildSkillDispatchPrompt,
@@ -1237,7 +1238,46 @@ export class CompanionCore {
     const existing = this.sessionManager.getSkillsBinding(conversationId);
     if (existing) {
       await assertResumeSnapshotAvailable(existing.catalogSnapshot);
-      if (!existing.configDir) {
+      let migrated = existing;
+      let changed = false;
+
+      if (!migrated.pluginDir) {
+        // Backfill for a binding persisted before plugin materialization
+        // existed AT ALL (a real, reproduced regression — see this change's
+        // own conversation-metadata census: hundreds of real, already-
+        // persisted conversations on disk with no pluginDir field of any
+        // kind). Without this, buildIsolatedOptions() below would pass
+        // `plugins: [{ type: "local", path: undefined, ... }]` straight to
+        // the SDK — empirically confirmed (real, unmocked query()) to NOT
+        // throw: the SDK silently fails to load the plugin
+        // (`plugin_errors: [{type:"path-not-found", ...}]` in its own
+        // system/init message) and the run completes normally with every
+        // approved skill for this conversation invisible to the model — a
+        // silent capability loss with no error surfaced anywhere, worse
+        // than a crash.
+        //
+        // Rebuilds the plugin directory from this binding's OWN
+        // already-pinned `catalogSnapshot` — see
+        // materializePluginFromCatalogSnapshot()'s own docstring for why
+        // that (never a live listCatalog() re-fetch) is what keeps this a
+        // backfill of already-recorded data rather than a refresh, honoring
+        // the same "a refresh during an active run leaves that run on its
+        // existing snapshot" guarantee the configDir backfill below already
+        // relies on. `allowedSkillNames`/`skillOverrides`/`skillsDir` are
+        // overwritten (not merely supplemented) with the freshly
+        // materialized, plugin-QUALIFIED forms — the pre-plugin binding's
+        // own copies of those three fields predate plugin-qualified naming
+        // and would otherwise silently mismatch what the SDK reports once
+        // this skill is loaded through a plugin.
+        const { pluginDir, skillsDir, allowedSkillNames, skillOverrides } = materializePluginFromCatalogSnapshot(
+          migrated.cwd,
+          migrated.catalogSnapshot
+        );
+        migrated = { ...migrated, pluginDir, skillsDir, allowedSkillNames, skillOverrides };
+        changed = true;
+      }
+
+      if (!migrated.configDir) {
         // Backfill for a binding persisted before this session's own
         // isolated Claude Code CLI config directory existed (see Part A of
         // upgrade-agent-reliability-and-workflows: host/agent/skills/
@@ -1252,9 +1292,13 @@ export class CompanionCore {
         // isolated config directory using the exact same
         // `${cwd}/claude-config` shape buildSessionSkills() uses for a
         // fresh binding.
-        const configDir = path.join(existing.cwd, "claude-config");
+        const configDir = path.join(migrated.cwd, "claude-config");
         fs.mkdirSync(configDir, { recursive: true });
-        const migrated = { ...existing, configDir };
+        migrated = { ...migrated, configDir };
+        changed = true;
+      }
+
+      if (changed) {
         this.sessionManager.setSkillsBinding(conversationId, migrated);
         return migrated;
       }

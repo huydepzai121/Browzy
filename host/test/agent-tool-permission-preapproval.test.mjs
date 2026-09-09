@@ -104,6 +104,7 @@ function fakeSkills() {
   return {
     cwd: "/scratch/conv-perm-preapproval",
     configDir: "/scratch/conv-perm-preapproval/claude-config",
+    pluginDir: "/scratch/conv-perm-preapproval/skills-plugin",
     allowedSkillNames: [],
     skillOverrides: {}
   };

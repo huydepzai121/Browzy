@@ -559,6 +559,27 @@ export function buildIsolatedOptions({
         "operator's real ~/.claude and writes session history there instead of this session's own workspace"
     );
   }
+  if (!skills.pluginDir) {
+    // Mirrors the configDir check just above, for the identical reason: a
+    // silent default (or simply passing `path: undefined` through to the
+    // SDK's `plugins` option below) re-creates the exact leak this guards
+    // against the first time a caller forgets to backfill it — empirically
+    // confirmed via a real, unmocked query(): the SDK does not throw, it
+    // silently fails to load the plugin (`plugin_errors:
+    // [{type:"path-not-found", ...}]` in its own system/init message) and
+    // the run completes with every approved skill for this conversation
+    // invisible to the model, with no error surfaced anywhere. Failing
+    // loudly here turns that silent capability loss into the same explicit,
+    // already-handled `options_build_failed` run_error every other
+    // buildIsolatedOptions() throw already produces (see
+    // host/agent/companion.js's `_runAfterLeaseGranted()`), rather than a
+    // degraded run nobody is told about.
+    throw new Error(
+      "buildIsolatedOptions requires skills.pluginDir (this session's own materialized local skill plugin " +
+        "directory, from buildSessionSkills()) — without it the SDK's `plugins` option resolves an undefined " +
+        "path and silently fails to load every approved skill for this conversation instead of throwing"
+    );
+  }
 
   const env = {
     PATH: process.env.PATH || process.env.Path || "",

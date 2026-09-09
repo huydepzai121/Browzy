@@ -193,7 +193,7 @@ console.log("\nConversation metadata schema, migration, and app/SDK snapshot bou
     mcpServer: { fake: "server" },
     serverName: "srv",
     snapshot: { model: "claude-x", env: { ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "https://x" } },
-    skills: { cwd: "/scratch/conv-1", configDir: "/scratch/conv-1/claude-config", allowedSkillNames: [], skillOverrides: {} }
+    skills: { cwd: "/scratch/conv-1", configDir: "/scratch/conv-1/claude-config", pluginDir: "/scratch/conv-1/skills-plugin", allowedSkillNames: [], skillOverrides: {} }
   });
   const policy = buildPermissionPolicyIdentity(options);
   ok(Array.isArray(policy.tools) && policy.tools.includes("Skill"), "permission policy identity derives `tools` from the real built options");
@@ -330,7 +330,7 @@ await sessionManagerTests();
     mcpServer: { fake: "server" },
     serverName: "srv",
     snapshot: { model: "claude-x", env: { ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "https://x" } },
-    skills: { cwd: "/scratch/conv-1", configDir: "/scratch/conv-1/claude-config", allowedSkillNames: [], skillOverrides: {} },
+    skills: { cwd: "/scratch/conv-1", configDir: "/scratch/conv-1/claude-config", pluginDir: "/scratch/conv-1/skills-plugin", allowedSkillNames: [], skillOverrides: {} },
     pageContext: { tabId: 1, url: "https://a.example/", title: "A", hostname: "a.example", revision: 1, boundAt: Date.now(), restricted: false, pinned: false, mustRead: false }
   });
   ok(optionsA.systemPrompt.snapshot === false, "systemPrompt.snapshot must be the STRICT boolean `false` (not merely `!== true`) — an explicit declaration, not an incidental omission");
@@ -339,7 +339,7 @@ await sessionManagerTests();
     mcpServer: { fake: "server" },
     serverName: "srv",
     snapshot: { model: "claude-x", env: { ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "https://x" } },
-    skills: { cwd: "/scratch/conv-1", configDir: "/scratch/conv-1/claude-config", allowedSkillNames: [], skillOverrides: {} },
+    skills: { cwd: "/scratch/conv-1", configDir: "/scratch/conv-1/claude-config", pluginDir: "/scratch/conv-1/skills-plugin", allowedSkillNames: [], skillOverrides: {} },
     pageContext: { tabId: 2, url: "https://b.example/", title: "B", hostname: "b.example", revision: 1, boundAt: Date.now(), restricted: false, pinned: false, mustRead: false }
   });
   ok(optionsB.systemPrompt.snapshot === false, "snapshot:false holds on a second, independently-bound run too");

@@ -175,7 +175,7 @@ await test("buildIsolatedOptions(): no pageContext -> no bound-page-context bloc
     mcpServer: { fake: "server" },
     serverName: "srv",
     snapshot: { model: "claude-x", env: { ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "https://x" } },
-    skills: { cwd: "/scratch/conv-1", configDir: "/scratch/conv-1/claude-config", allowedSkillNames: [], skillOverrides: {} }
+    skills: { cwd: "/scratch/conv-1", configDir: "/scratch/conv-1/claude-config", pluginDir: "/scratch/conv-1/skills-plugin", allowedSkillNames: [], skillOverrides: {} }
   });
   // The systemPrompt field itself is always present now — it carries the
   // unconditional browsing-workflow guidance, which every run needs and which
@@ -191,7 +191,7 @@ await test("buildIsolatedOptions(): a bound pageContext becomes options.systemPr
     mcpServer: { fake: "server" },
     serverName: "srv",
     snapshot: { model: "claude-x", env: { ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "https://x" } },
-    skills: { cwd: "/scratch/conv-1", configDir: "/scratch/conv-1/claude-config", allowedSkillNames: [], skillOverrides: {} },
+    skills: { cwd: "/scratch/conv-1", configDir: "/scratch/conv-1/claude-config", pluginDir: "/scratch/conv-1/skills-plugin", allowedSkillNames: [], skillOverrides: {} },
     pageContext: {
       tabId: 42,
       url: "https://vnexpress.net/a",

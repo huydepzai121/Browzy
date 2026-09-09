@@ -10,7 +10,12 @@
 export { importSkill, refreshSkill } from "./import.js";
 export { authorSkill, isAuthoredSkillRecord, authoredSkillsRoot } from "./author.js";
 export { listCatalog, getSkill, enableSkill, disableSkill, removeSkill, setInvocationFlags } from "./manage.js";
-export { buildSessionSkills, assertCanonicalSkillResourcePath, SESSION_SKILLS_PLUGIN_NAME } from "./session-workspace.js";
+export {
+  buildSessionSkills,
+  materializePluginFromCatalogSnapshot,
+  assertCanonicalSkillResourcePath,
+  SESSION_SKILLS_PLUGIN_NAME
+} from "./session-workspace.js";
 export { assertSlashDispatchAllowed, assertResumeSnapshotAvailable, buildSkillDispatchPrompt } from "./dispatch.js";
 export { toSkillOverrideValue } from "./capabilities.js";
 export {

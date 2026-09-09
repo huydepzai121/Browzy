@@ -185,6 +185,7 @@ await test("buildIsolatedOptions composes cwd/skills/skillOverrides and adds the
     skills: {
       cwd: "/scratch/conv-1",
       configDir: "/scratch/conv-1/claude-config",
+      pluginDir: "/scratch/conv-1/skills-plugin",
       allowedSkillNames: ["alpha", "beta"],
       skillOverrides: { alpha: "on", beta: "user-invocable-only" }
     }
