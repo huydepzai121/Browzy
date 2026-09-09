@@ -37,6 +37,7 @@ import {
   ATTACHMENT_MIME_TYPES,
   validateStartAttachments,
   validateStartEffort,
+  validateStartSessionChoice,
   attachmentKind,
   makeEnvelope,
   validateHello,
@@ -49,7 +50,13 @@ import {
 import { TranscriptStore } from "./storage/transcript-store.js";
 import { PendingRecordingsStore } from "./storage/pending-recordings.js";
 import { ActionArtifactStore } from "./storage/action-timeline.js";
-import { buildAppProfileIdentity, buildSessionSchemaIdentity, buildPermissionPolicyIdentity } from "./storage/conversation-metadata.js";
+import {
+  buildAppProfileIdentity,
+  buildSessionSchemaIdentity,
+  buildPermissionPolicyIdentity,
+  assessResumeCompatibility,
+  SDK_SESSION_REF_STATUS
+} from "./storage/conversation-metadata.js";
 import {
   conversationAttachmentsDir,
   conversationDir,
@@ -62,6 +69,7 @@ import { ToolBridge } from "./broker/tool-bridge.js";
 import { ApprovalRegistry } from "./policy/approvals.js";
 import { createCanUseTool, RequestIdTracker } from "./policy/can-use-tool.js";
 import { SessionManager } from "./session/manager.js";
+import { RUN_STATES } from "./session/run.js";
 import { TokenBatcher } from "./session/token-batcher.js";
 import { createBrowserMcpServer, SDK_MCP_SERVER_NAME } from "./tools/adapter.js";
 import { createAskUserTool, ASK_USER_TOOL_NAME } from "./tools/ask-the-user.js";
@@ -1119,7 +1127,7 @@ export class CompanionCore {
     // refs themselves carry no authority of any kind: tabScope, lease,
     // approval, and upload-allowlist decisions never consult them (design.md
     // Decision 5).
-    const { conversationId, profileId, modelId, tabScope, prompt, context, attachments, effort } = envelope;
+    const { conversationId, profileId, modelId, tabScope, prompt, context, attachments, effort, newSdkSession } = envelope;
     if (!conversationId) return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, { reason: "missing_conversation_id" });
     // Rejected here, before any run exists, for the same reason a malformed
     // attachment is: a turn must never run at a different reasoning depth
@@ -1137,6 +1145,15 @@ export class CompanionCore {
       return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, {
         reason: "malformed_attachments",
         detail: attachmentsResult.reason,
+        conversationId
+      });
+    }
+    // Tasks.md 2.4/2.5's explicit recovery signal — see
+    // validateStartSessionChoice's own doc comment.
+    const sessionChoiceResult = validateStartSessionChoice(newSdkSession);
+    if (!sessionChoiceResult.ok) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.ERROR, {
+        reason: sessionChoiceResult.reason,
         conversationId
       });
     }
@@ -1201,7 +1218,8 @@ export class CompanionCore {
       prompt,
       context,
       attachmentRefs: attachmentsResult.refs,
-      effort: effortResult.effort
+      effort: effortResult.effort,
+      newSdkSession: sessionChoiceResult.newSdkSession
     }).catch((err) => {
       run.emit({ type: "run_error", error: String((err && err.message) || err) });
       this.sessionManager.finishRun(conversationId);
@@ -1311,7 +1329,7 @@ export class CompanionCore {
     return binding;
   }
 
-  async _runAfterLeaseGranted(run, { profileId, modelId, prompt, context, attachmentRefs = [], effort = null }) {
+  async _runAfterLeaseGranted(run, { profileId, modelId, prompt, context, attachmentRefs = [], effort = null, newSdkSession = false }) {
     const conversationId = run.conversationId;
     const granted = await run.begin();
     if (!granted) {
@@ -1407,6 +1425,56 @@ export class CompanionCore {
       return;
     }
 
+    // Tasks.md 2.4: resume-compatibility gate, run BEFORE any SDK call is
+    // made (before options are even built) — decision 2.4: "reject
+    // incompatible endpoint/model/skill/cwd/session identity ... with
+    // explicit recovery/new-conversation UI". Compares this run's freshly
+    // resolved identity against whatever the conversation already has bound
+    // (bindConversationAppSnapshot's "first bind wins" record) — see
+    // assessResumeCompatibility()'s own docstring for exactly which fields
+    // are compared and why. A conversation with nothing bound yet (its very
+    // first run, or a genuinely legacy pre-2.1 record) is always reported
+    // compatible — there is nothing to conflict with, and this run's own
+    // bindConversationAppSnapshot() call below performs the first bind.
+    //
+    // `newSdkSession` (tasks.md 2.4/2.5's "explicit new context/session
+    // choice") is the ONLY way past a real mismatch: it does not change what
+    // gets bound (appProfile stays whatever was bound at turn 1 — bind-once
+    // is still enforced), it only means this turn proceeds anyway, without
+    // ever attempting SDK `resume` (see resumeSessionId below) — the
+    // conversation's original identity is never silently overwritten by a
+    // one-off different profile/model choice; a PERMANENT switch still
+    // requires a new conversation, exactly as the recovery UI's two named
+    // options ("recovery" vs "new-conversation") imply.
+    const boundMetadataForCompat = this.sessionManager.getConversationMetadata(conversationId);
+    const currentIdentityForCompat = {
+      appProfile: buildAppProfileIdentity({
+        profileId,
+        baseUrl: snapshot.env.ANTHROPIC_BASE_URL,
+        modelId: snapshot.model,
+        credentialRevision: snapshot.credentialRevision ?? null
+      }),
+      sessionSchemaIdentity: buildSessionSchemaIdentity(skills)
+    };
+    const compatibility = assessResumeCompatibility({ bound: boundMetadataForCompat, current: currentIdentityForCompat });
+    if (!compatibility.compatible && !newSdkSession) {
+      run.emit({
+        type: "run_error",
+        reason: "conversation_identity_incompatible",
+        detail: "this conversation is bound to a different endpoint/model/skill identity than this turn resolved to",
+        mismatches: compatibility.mismatches
+      });
+      run.stop("conversation_identity_incompatible");
+      this.sessionManager.finishRun(conversationId);
+      return;
+    }
+    // The session id THIS turn should ask the SDK to resume, or null to run
+    // a fresh SDK session (tasks.md 2.5: never retried automatically once a
+    // ref is MISSING/RESUME_FAILED — see SessionManager.getResumeSessionId's
+    // own doc comment). An explicit `newSdkSession` always forces null,
+    // regardless of what is bound — the whole point of the recovery choice.
+    const resumeSessionId = newSdkSession ? null : this.sessionManager.getResumeSessionId(conversationId);
+
     // Task 9.5: build the application-owned ask-the-user tool bound to this
     // run + this companion's _pendingQuestions tracker. Registered alongside
     // the browser tools on the same SDK MCP server, so the SDK's tools/
@@ -1444,7 +1512,8 @@ export class CompanionCore {
         // so the model can actually see and call it. The two must move
         // together — see buildIsolatedOptions' note on extraToolNames.
         extraToolNames: [ASK_USER_TOOL_NAME],
-        effort
+        effort,
+        resume: resumeSessionId || undefined
       });
     } catch (err) {
       run.emit({ type: "run_error", reason: "options_build_failed", detail: err.message });
@@ -1465,13 +1534,11 @@ export class CompanionCore {
     // authorization try/catch above).
     try {
       this.sessionManager.bindConversationAppSnapshot(conversationId, {
-        appProfile: buildAppProfileIdentity({
-          profileId,
-          baseUrl: snapshot.env.ANTHROPIC_BASE_URL,
-          modelId: snapshot.model,
-          credentialRevision: snapshot.credentialRevision ?? null
-        }),
-        sessionSchemaIdentity: buildSessionSchemaIdentity(skills),
+        // Reuse the SAME identity object the compatibility gate above just
+        // computed and compared — never a second, independent derivation
+        // that could silently disagree with what was actually checked.
+        appProfile: currentIdentityForCompat.appProfile,
+        sessionSchemaIdentity: currentIdentityForCompat.sessionSchemaIdentity,
         permissionPolicy: buildPermissionPolicyIdentity(options)
       });
     } catch {
@@ -1479,7 +1546,7 @@ export class CompanionCore {
       // note above for the identical rationale.
     }
 
-    await this._runQuery(run, queryPrompt, options, attachments);
+    await this._runQuery(run, queryPrompt, options, attachments, { resumeAttempted: Boolean(resumeSessionId) });
   }
 
   /**
@@ -1522,7 +1589,16 @@ export class CompanionCore {
     return resolved;
   }
 
-  async _runQuery(run, prompt, options, attachments = []) {
+  /**
+   * @param {object} [opts]
+   * @param {boolean} [opts.resumeAttempted] - tasks.md 2.5: whether THIS
+   *   call actually asked the SDK to `resume` an existing session (i.e.
+   *   `options.resume` is set). Used only to decide whether a thrown/error
+   *   result gets classified as a resume-specific failure
+   *   (session_missing/session_resume_failed) — a plain first-turn query()
+   *   failure (no resume attempted) must never be mislabeled that way.
+   */
+  async _runQuery(run, prompt, options, attachments = [], { resumeAttempted = false } = {}) {
     const sdk = this.sdk || (await import("@anthropic-ai/claude-agent-sdk"));
     // Without attachments this stays the EXISTING plain-string query() call,
     // byte-for-byte (the common case carries zero new risk). With them, the
@@ -1533,8 +1609,19 @@ export class CompanionCore {
     // already proves against real gateways for its own vision check. The
     // user's typed text is never rewritten or annotated (no synthetic
     // "see attached image" prose); the model sees the real text plus the
-    // real image blocks and nothing else.
+    // real image blocks and nothing else. This is also tasks.md 2.5's own
+    // "no failure path synthesizes memory from transcript events" guarantee
+    // made structural: `prompt` here is ALWAYS derived from this turn's own
+    // `queryPrompt`/attachments alone — resume (when attempted) asks the SDK
+    // to load prior context server-side; this process never reads its own
+    // transcript log back into a request.
     const queryPrompt = attachments.length ? buildAttachmentPrompt(prompt, attachments) : prompt;
+    // Tracks whether this turn's `system`/`init` message actually reported a
+    // session_id, so the catch block below can tell "the SDK never even got
+    // to report an id" (a real resume/startup failure) apart from "an id was
+    // captured and something later in the stream failed" (not a session
+    // continuity problem at all).
+    let sessionIdCaptured = false;
     try {
       for await (const message of sdk.query({ prompt: queryPrompt, options })) {
         // Capture the SDK's own advertised slash-command list wherever this
@@ -1544,14 +1631,62 @@ export class CompanionCore {
         // fail the run itself, so it is logged nowhere but swallowed here
         // exactly like every other best-effort disk write in this file
         // (e.g. authorizeBorrowedTabMutation's catch above).
-        if (message.type === "system" && message.subtype === "init" && Array.isArray(message.slash_commands)) {
-          try {
-            recordAdvertisedCommands({ commands: message.slash_commands, terminalCommands: message.terminal_slash_commands });
-          } catch {
-            // Observation only — never surfaced as a run error (design.md decision 4).
+        if (message.type === "system" && message.subtype === "init") {
+          if (Array.isArray(message.slash_commands)) {
+            try {
+              recordAdvertisedCommands({ commands: message.slash_commands, terminalCommands: message.terminal_slash_commands });
+            } catch {
+              // Observation only — never surfaced as a run error (design.md decision 4).
+            }
+          }
+          // Tasks.md 2.3: atomic SDK-reference ownership. Captured for EVERY
+          // run (not only a resumed one) — this is how a conversation's
+          // very first turn acquires a reference at all. Best-effort: a
+          // failure here (e.g. this conversation was deleted the instant
+          // this message arrived) must never fail an otherwise-successful
+          // turn — see claimSdkSessionRef's own tombstone guard.
+          if (typeof message.session_id === "string" && message.session_id) {
+            sessionIdCaptured = true;
+            try {
+              this.sessionManager.claimSdkSessionRef(run.conversationId, { sessionId: message.session_id });
+            } catch {
+              // best-effort — see comment above
+            }
           }
         }
         run.emit({ type: "stream_message", message });
+      }
+    } catch (err) {
+      // A deliberate user/system stop already emitted run_stopped and
+      // released the lease synchronously (Run.stop()) — the abort this
+      // produces (gate-0.2 evidence G5: a thrown "Operation aborted") is
+      // expected, not a session-continuity failure, and must never be
+      // reclassified or double-reported here.
+      if (run.state !== RUN_STATES.STOPPED) {
+        const detail = String((err && err.message) || err);
+        let reason = "run_error";
+        // Tasks.md 2.5: classify an explicit resume failure so the caller
+        // gets a specific, actionable reason instead of a generic run_error
+        // — and mark the reference's status (never clearing the captured
+        // sessionId itself) so a later turn does not silently retry the
+        // exact same resume every time (SessionManager.getResumeSessionId()
+        // only offers an id whose status is still ACTIVE).
+        if (resumeAttempted && !sessionIdCaptured) {
+          // Gate-0.2 evidence G2's exact observed shape: both a thrown
+          // terminal error and (where captured before the throw) a `result`
+          // message with `is_error:true`/`subtype:"error_during_execution"`
+          // whose message names the missing session id.
+          reason = /no conversation found|session id/i.test(detail) ? "session_missing" : "session_resume_failed";
+          try {
+            this.sessionManager.markSdkSessionRefStatus(
+              run.conversationId,
+              reason === "session_missing" ? SDK_SESSION_REF_STATUS.MISSING : SDK_SESSION_REF_STATUS.RESUME_FAILED
+            );
+          } catch {
+            // best-effort — see comment above
+          }
+        }
+        run.emit({ type: "run_error", reason, detail });
       }
     } finally {
       this.sessionManager.finishRun(run.conversationId);

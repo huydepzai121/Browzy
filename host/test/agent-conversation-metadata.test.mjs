@@ -427,9 +427,14 @@ async function companionWiringTest() {
   ok(!serialized.includes("bound_page_context"), "the bound conversation metadata never carries any rendered system-prompt text");
 
   // A second START on the SAME conversation with a DIFFERENT profile/model
-  // must not silently rewrite the already-bound identity (2.4's job to
-  // reject/react to a mismatch is out of this task's scope — this task only
-  // proves the bind step itself never overwrites once bound).
+  // must not silently rewrite the already-bound identity. Superseded by
+  // tasks 2.3-2.5 (osf-apply, same change): a genuinely different endpoint/
+  // model is now the concrete case task 2.4's compatibility gate exists to
+  // catch — see host/test/agent-session-continuity.test.mjs for the full
+  // 2.3/2.4/2.5 evidence. This assertion is updated in place (not weakened)
+  // to match the now-implemented behavior: the mismatched turn is rejected
+  // BEFORE query() is ever called, and the bound identity still never
+  // changes.
   await core.handleEnvelope(
     makeEnvelope(AGENT_MESSAGE_TYPES.START, {
       conversationId,
@@ -438,11 +443,15 @@ async function companionWiringTest() {
       prompt: "second turn"
     })
   );
-  const deadline2 = Date.now() + 3000;
-  while (calls.length < 2 && Date.now() < deadline2) await new Promise((r) => setTimeout(r, 15));
-  ok(calls.length === 2, "the second run also reached query()");
+  const deadline2 = Date.now() + 500;
+  while (Date.now() < deadline2) await new Promise((r) => setTimeout(r, 15));
+  ok(calls.length === 1, "a run whose resolved model disagrees with the conversation's already-bound identity is rejected before query() (task 2.4), not silently run");
+  const snapAfterSecondRun = sessionManager.snapshotSince(conversationId, 0);
+  const rejectionEvent = snapAfterSecondRun.events.find((e) => e.type === "run_error" && e.reason === "conversation_identity_incompatible");
+  ok(Boolean(rejectionEvent), "the rejection is a structured, explicit run_error, not a silent no-op");
   const metaAfterSecondRun = sessionManager.getConversationMetadata(conversationId);
   ok(metaAfterSecondRun.appProfile.profileId === "my-profile", "a second run with a different profileId never overwrites the conversation's already-bound app profile identity");
+  ok(metaAfterSecondRun.appProfile.modelId === "claude-fake-model", "...nor its modelId");
 }
 await companionWiringTest();
 

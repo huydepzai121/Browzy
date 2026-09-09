@@ -515,6 +515,22 @@ export async function resolveProfileSnapshot({ profileId, modelId, profileProvid
  *   host/agent/protocol.js's `validateStartEffort()`. Null (the default)
  *   sends no effort parameter at all, leaving the model's own default in
  *   force — deliberately not the same as pinning it to today's default.
+ * @param {string} [params.resume] - tasks.md 2.3/2.4: the SDK `session_id`
+ *   this turn should resume, already gated by
+ *   `SessionManager.getResumeSessionId()` (only offered when a compatible,
+ *   ACTIVE reference exists — see host/agent/companion.js's
+ *   `_runAfterLeaseGranted()`) — this function performs NO compatibility or
+ *   staleness check of its own, it only forwards the decision already made.
+ *   Omitted (undefined) means "run a fresh SDK session", identical to every
+ *   call before this task existed. `persistSession` is always explicitly
+ *   `true` regardless (gate-0.2's own load-bearing finding: decision 1
+ *   requires "Valid sessions use resume ... No `continue` option is used as
+ *   a substitute for a durable mapping" — a session that cannot be persisted
+ *   could never be resumed later, defeating the entire mapping this task
+ *   builds). `forkSession` is deliberately NOT wired here — tasks.md 2.3-2.5
+ *   scope is resume/reject/recover, not an explicit-branch UI; decision 1
+ *   reserves `forkSession` for "a deliberate branch ... an explicit
+ *   new-conversation action", which is out of this task's scope.
  * @param {string[]} [params.browserToolNames] - the legacy names of every
  *   browser tool actually registered on `mcpServer`. Defaults to
  *   `sdkQualifiedToolNames()`'s own default (host/agent/tools/adapter.js's
@@ -539,7 +555,8 @@ export function buildIsolatedOptions({
   canUseTool,
   browserToolNames,
   extraToolNames = [],
-  effort = null
+  effort = null,
+  resume
 }) {
   if (!mcpServer) throw new Error("buildIsolatedOptions requires mcpServer");
   if (!serverName) throw new Error("buildIsolatedOptions requires serverName");
@@ -750,6 +767,14 @@ export function buildIsolatedOptions({
     // is deliberately not the same as pinning it to whatever that default is
     // today.
     ...(effort ? { effort } : {}),
+    // Tasks.md 2.3/2.4: explicit, always-on session persistence (see this
+    // parameter's own docstring above for why "always true" rather than
+    // conditional on whether THIS turn happens to resume). `resume` itself
+    // is only set when the caller (companion.js) actually resolved one —
+    // omitted entirely otherwise, byte-identical to every call before this
+    // task existed.
+    persistSession: true,
+    ...(resume ? { resume } : {}),
     // Task 9.2: only set when the caller actually wired a canUseTool
     // callback (the host runs that need the send/submit-class gate do).
     // Absent → the SDK falls back to its default permission path for any

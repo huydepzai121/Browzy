@@ -20,9 +20,9 @@ All tasks are intentionally unchecked. This change is specification-only. Scope 
 
 - [x] 2.1 Define versioned conversation metadata with secret-free app profile endpoint/model/credential-revision identity, skill identity, permission policy, SDK session reference, cwd/session schema identity, budget policy, lifecycle, usage epoch, and migration state.
 - [x] 2.2 Separate the app immutable provider/policy snapshot from the SDK persisted prompt/system snapshot; ensure every resumed turn obtains fresh page/document context and does not freeze a prior custom system prompt.
-- [ ] 2.3 Implement atomic SDK-reference ownership, one active run per conversation, browser/native lease release, and deletion tombstones; deletion must remove SDK mapping, ledger, recording claims, and conversation-owned artifacts without late resurrection.
-- [ ] 2.4 Resume only compatible SDK sessions; reject incompatible endpoint/model/skill/cwd/session identity or unavailable current credentials with explicit recovery/new-conversation UI and no historical-secret reconstruction.
-- [ ] 2.5 Handle stop, restart, cancellation, partial turns, concurrent starts, missing sessions, legacy conversations, and unknown in-flight effects without replaying browser mutations. <- (verify: no failure path synthesizes memory from transcript events)
+- [x] 2.3 Implement atomic SDK-reference ownership, one active run per conversation, browser/native lease release, and deletion tombstones; deletion must remove SDK mapping, ledger, recording claims, and conversation-owned artifacts without late resurrection.
+- [x] 2.4 Resume only compatible SDK sessions; reject incompatible endpoint/model/skill/cwd/session identity or unavailable current credentials with explicit recovery/new-conversation UI and no historical-secret reconstruction.
+- [x] 2.5 Handle stop, restart, cancellation, partial turns, concurrent starts, missing sessions, legacy conversations, and unknown in-flight effects without replaying browser mutations. <- (verify: no failure path synthesizes memory from transcript events)
 - [ ] 2.6 Add two-turn, restart, incompatible-selection, missing-session, credential-unavailable, fork/new-conversation, cancellation, partial-turn, race, late-unwind, and deletion tests.
 
 ## 3. P0 Evidence-Backed Approval

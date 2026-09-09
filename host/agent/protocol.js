@@ -278,6 +278,27 @@ export function validateStartEffort(value) {
 }
 
 /**
+ * Validate START's optional `newSdkSession` field (tasks.md 2.4/2.5's
+ * "explicit new context/session choice"): an explicit, user-initiated
+ * request to start THIS turn as a brand-new SDK session for an already-
+ * bound conversation, instead of attempting `resume` — the recovery action
+ * for a conversation whose captured SDK session reference is missing,
+ * failed a resume attempt, or (design.md decision 2.4) is incompatible with
+ * the profile/model this Send actually resolved to. Absent/false is the
+ * ordinary path (attempt resume when a compatible, ACTIVE reference
+ * exists); true never replays anything from the transcript — it only skips
+ * the `resume` option for this one query() call, exactly like every
+ * conversation's very first turn already does.
+ *
+ * @returns {{ok: true, newSdkSession: boolean} | {ok: false, reason: string}}
+ */
+export function validateStartSessionChoice(value) {
+  if (value === undefined || value === null) return { ok: true, newSdkSession: false };
+  if (typeof value !== "boolean") return { ok: false, reason: "malformed_new_sdk_session" };
+  return { ok: true, newSdkSession: value };
+}
+
+/**
  * Validate START's optional `attachments` field into normalized refs.
  * Absent/undefined is valid (no attachments); anything present must be an
  * array of {id, mimeType, byteLength} objects with a non-empty string id, an

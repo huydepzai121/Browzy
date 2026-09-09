@@ -12,7 +12,7 @@ import crypto from "node:crypto";
 import { Run, RUN_STATES } from "./run.js";
 import { PendingRecordingsStore } from "../storage/pending-recordings.js";
 import { sanitizeActionEvent, PerStreamSeqTracker } from "../storage/action-timeline.js";
-import { migrateConversationMetadata } from "../storage/conversation-metadata.js";
+import { migrateConversationMetadata, buildSdkSessionRef, SDK_SESSION_REF_STATUS } from "../storage/conversation-metadata.js";
 
 export function newConversationId() {
   return `conv_${crypto.randomBytes(9).toString("hex")}`;
@@ -113,6 +113,17 @@ export class SessionManager {
    * deleted). Used by companion.js to reply unknown_conversation rather than
    * a false "deleted:true" for an id that was never valid. */
   hasConversation(conversationId) {
+    // Tasks.md 2.3: the tombstone (this._deletedConversations), not a
+    // successful on-disk rmSync, is what commits "this conversation no
+    // longer exists" for every read in THIS process — deleteConversation()'s
+    // disk removal is best-effort (a still-open file handle from an
+    // aborting SDK subprocess can make it throw on Windows; finishRun()'s
+    // late-unwind sweep retries it). Without this check, a reader in the
+    // window between a tombstoned delete and that retry succeeding would
+    // see loadMeta() still return the not-yet-removed file and report a
+    // just-deleted conversation as present again — exactly the late
+    // resurrection this guard exists to prevent.
+    if (this._deletedConversations.has(conversationId)) return false;
     return Boolean(this.store.loadMeta(conversationId));
   }
 
@@ -214,6 +225,12 @@ export class SessionManager {
    * @returns {object|null} null for an unknown/deleted conversation
    */
   getConversationMetadata(conversationId) {
+    // See hasConversation()'s identical guard: the tombstone, not a
+    // successful on-disk removal, is what commits a delete for THIS
+    // process's reads too — never resurrect a deleted conversation's
+    // metadata (including its sdkSessionRef) just because the underlying
+    // rmSync had not yet (or failed to) finish.
+    if (this._deletedConversations.has(conversationId)) return null;
     const meta = this.store.loadMeta(conversationId);
     if (!meta) return null;
     const migrated = migrateConversationMetadata(meta);
@@ -253,6 +270,101 @@ export class SessionManager {
   }
 
   /**
+   * Atomic (compare-and-set style) SDK-reference ownership (tasks.md 2.3).
+   * Called by host/agent/companion.js's `_runQuery()` the moment a run's
+   * `system`/`init` message reports a `session_id` — for a fresh (never
+   * resumed) query() that is this conversation's FIRST captured id; for a
+   * resumed query() the SDK always echoes the SAME id back (gate-0.2
+   * evidence G1/G10), so this is also the normal per-turn confirmation path.
+   *
+   * "Atomic" here means "single-writer, single-active-run" — real filesystem
+   * locking is unnecessary because SessionManager.startRun() already
+   * guarantees at most one Run exists per conversationId at a time (this
+   * class's own invariant, enforced above), so at most one caller can ever
+   * reach this method for a given conversationId concurrently. The
+   * compare-and-set contract this method still enforces on top of that:
+   *   - No existing ref, OR the existing ref's `sessionId` matches exactly
+   *     -> claim succeeds, ref is written/refreshed to ACTIVE.
+   *   - An existing ref whose last known status is NOT ACTIVE (MISSING or
+   *     RESUME_FAILED — see markSdkSessionRefStatus) -> claim succeeds even
+   *     for a DIFFERENT `sessionId`. That old id was already established as
+   *     unresumable (getResumeSessionId() only ever offers an ACTIVE id, so
+   *     THIS run could not have attempted to resume it) — the fresh id
+   *     replacing it is this conversation's new working session, not a
+   *     surprise.
+   *   - An existing ACTIVE ref with a DIFFERENT `sessionId` -> claim is
+   *     REJECTED (the stored ref is left untouched) rather than silently
+   *     overwritten — an unexpected different id while the recorded one was
+   *     still believed usable (no `forkSession`/explicit new-session choice
+   *     was requested) is a fact worth surfacing, never a silent identity
+   *     swap.
+   *
+   * @param {string} conversationId
+   * @param {{sessionId: string}} params
+   * @returns {{claimed: boolean, ref: object|null, conflict?: boolean}}
+   */
+  claimSdkSessionRef(conversationId, { sessionId }) {
+    if (this._deletedConversations.has(conversationId)) return { claimed: false, ref: null };
+    const current = this.getConversationMetadata(conversationId);
+    if (!current) return { claimed: false, ref: null };
+    const existingRef = current.sdkSessionRef;
+    const sameId = existingRef && existingRef.sessionId === sessionId;
+    const existingIsStale = existingRef && existingRef.status !== SDK_SESSION_REF_STATUS.ACTIVE;
+    if (existingRef && !sameId && !existingIsStale) {
+      return { claimed: false, ref: existingRef, conflict: true };
+    }
+    const ref = buildSdkSessionRef({ sessionId, status: SDK_SESSION_REF_STATUS.ACTIVE, previous: sameId ? existingRef : null });
+    const next = { ...current, sdkSessionRef: ref };
+    this.store.updateMeta(conversationId, { conversationMetadata: next });
+    return { claimed: true, ref };
+  }
+
+  /**
+   * Record an explicit resume-failure outcome (tasks.md 2.5) WITHOUT
+   * clearing the captured `sessionId` — "never auto-clear a ref on resume
+   * failure": the id stays on disk so an explicit later retry (or a human
+   * inspecting state) still has it, and so a transient failure can never be
+   * silently "fixed" by quietly starting a brand-new session under the same
+   * conversation next turn. Only companion.js's classified resume-failure
+   * path calls this (see `_runQuery()`'s catch block); a run that never
+   * attempted resume never touches this.
+   *
+   * @param {string} conversationId
+   * @param {string} status - one of SDK_SESSION_REF_STATUS (MISSING or
+   *   RESUME_FAILED)
+   * @returns {object|null} the updated ref, or null if there was nothing to
+   *   mark (unknown/deleted conversation, or no ref was ever captured)
+   */
+  markSdkSessionRefStatus(conversationId, status) {
+    if (this._deletedConversations.has(conversationId)) return null;
+    const current = this.getConversationMetadata(conversationId);
+    const existingRef = current && current.sdkSessionRef;
+    if (!existingRef) return null;
+    const ref = buildSdkSessionRef({ sessionId: existingRef.sessionId, status, previous: existingRef });
+    const next = { ...current, sdkSessionRef: ref };
+    this.store.updateMeta(conversationId, { conversationMetadata: next });
+    return ref;
+  }
+
+  /**
+   * The session id a run should pass as the SDK's `resume` option, or `null`
+   * when none should be attempted — ONLY when a ref exists AND its last
+   * known status is ACTIVE (tasks.md 2.5: a MISSING/RESUME_FAILED ref is
+   * never retried automatically; that would be exactly the "quiet
+   * degradation" this change exists to eliminate — see
+   * markSdkSessionRefStatus's own doc comment).
+   *
+   * @param {string} conversationId
+   * @returns {string|null}
+   */
+  getResumeSessionId(conversationId) {
+    const current = this.getConversationMetadata(conversationId);
+    const ref = current && current.sdkSessionRef;
+    if (!ref || ref.status !== SDK_SESSION_REF_STATUS.ACTIVE) return null;
+    return ref.sessionId;
+  }
+
+  /**
    * Every currently active (queued or running) run started by THIS process
    * for the given profileId — used to cancel runs when their credential is
    * revoked (host/agent/companion.js's onCredentialRevoked wiring; design.md
@@ -288,7 +400,28 @@ export class SessionManager {
     const run = this._activeRuns.get(conversationId);
     if (run) run.markDone();
     this._activeRuns.delete(conversationId);
-    if (this._deletedConversations.has(conversationId)) return; // see this._deletedConversations' header comment
+    if (this._deletedConversations.has(conversationId)) {
+      // Late-unwind sweep (tasks.md 2.3): deleteConversation() already
+      // removed the on-disk directory synchronously, but the SDK's own
+      // query() generator can still be unwinding asynchronously when a
+      // delete races an active run (gate-0.2 evidence G5: ~7s abort->settle
+      // latency) — e.g. the CLI subprocess still holding its session
+      // `.jsonl` file open under this conversation's `configDir` at the
+      // moment the first delete ran (a real possibility on Windows, where an
+      // open handle can make an rmSync throw despite `force: true`).
+      // Retrying now that this run has genuinely finished and released every
+      // handle it held closes that window without resurrecting anything —
+      // it only ever re-removes a directory a real deleteConversation() call
+      // already committed to removing. Best-effort: a failure here must
+      // never throw out of finishRun (mirrors every other best-effort
+      // cleanup in this file).
+      try {
+        this.store.deleteConversation(conversationId);
+      } catch {
+        // best-effort — see comment above
+      }
+      return;
+    }
     this.store.updateMeta(conversationId, { activeRunId: null });
   }
 
@@ -300,25 +433,62 @@ export class SessionManager {
    * "Recordings live in a separate tree ... and are untouched" — design.md
    * section 5's separate retention for recorded demonstrations holds).
    *
-   * "Handled explicitly, not left racy" for an active run: the run is
-   * stopped (aborting the SDK call and invalidating its approvals)
-   * SYNCHRONOUSLY, before anything on disk is removed, and this
-   * conversationId is tombstoned (this._deletedConversations) so any event
-   * the aborting run's query() loop still emits asynchronously afterward is
-   * dropped rather than resurrecting the just-deleted directory — see the
-   * field's own header comment and the guards in startRun/finishRun/
-   * setSkillsBinding above.
+   * Tasks.md 2.3 also names "SDK mapping, ledger, recording claims, and
+   * conversation-owned artifacts" as things deletion must remove. Concretely,
+   * today:
+   *   - SDK mapping (`sdkSessionRef`) lives inside this SAME conversation's
+   *     `conversationMetadata`, and the SDK's own on-disk session storage
+   *     lives under `skills.configDir` (= `${conversationDir}/claude-config`)
+   *     — both are inside the directory this method removes, so no separate
+   *     step is needed.
+   *   - "Ledger" (group 5's usage ledger) does not exist yet — nothing to
+   *     remove.
+   *   - "Recording claims": `PendingRecordingsStore` is companion-wide, not
+   *     conversation-owned, and only ever holds a recording BEFORE any
+   *     conversation has claimed it (see its own file header) — once
+   *     attached, a recording becomes a `recording_complete` transcript
+   *     event, which lives inside (and is removed with) this same
+   *     directory. There is no conversation-scoped "claim" state anywhere
+   *     else to clean up.
+   *   - "Conversation-owned artifacts" (screenshots, user attachments) live
+   *     under `conversationArtifactsDir(conversationId)`, itself inside
+   *     `conversationDir(conversationId)` — removed by the same rmSync.
+   *
+   * "Handled explicitly, not left racy" for an active run (tasks.md 2.3:
+   * "Deletion marks a tombstone before aborting"): this conversationId is
+   * tombstoned (this._deletedConversations) FIRST, before the run is
+   * stopped (aborting the SDK call and invalidating its approvals) or
+   * anything on disk is removed — so any event the aborting run's query()
+   * loop still emits asynchronously afterward (including a late
+   * claimSdkSessionRef()/markSdkSessionRefStatus() call) is dropped rather
+   * than resurrecting the just-deleted directory. See the field's own
+   * header comment and the guards in startRun/finishRun/setSkillsBinding/
+   * claimSdkSessionRef/markSdkSessionRefStatus above.
+   *
+   * The on-disk removal itself is best-effort (try/catch): a still-open
+   * file handle from the aborting SDK subprocess can make the underlying
+   * rmSync throw despite `force: true` (observed on Windows) — the
+   * tombstone above, not this rmSync succeeding, is what actually commits
+   * "this conversation no longer exists" for every future read in THIS
+   * process (hasConversation/loadMeta consult the tombstone-guarded store,
+   * and every write path is guarded the same way). finishRun()'s own
+   * late-unwind sweep retries this exact removal once the aborting run has
+   * genuinely finished, closing the window without resurrecting anything.
    *
    * @returns {{ hadActiveRun: boolean }}
    */
   deleteConversation(conversationId) {
+    this._deletedConversations.add(conversationId);
     const hadActiveRun = this.hasActiveRun(conversationId);
     this.stopRun(conversationId, "conversation_deleted");
     this._activeRuns.delete(conversationId);
-    this._deletedConversations.add(conversationId);
     this._actionEventCursors.delete(conversationId);
     this._actionEventCursorsSeeded.delete(conversationId);
-    this.store.deleteConversation(conversationId);
+    try {
+      this.store.deleteConversation(conversationId);
+    } catch {
+      // best-effort — see comment above; finishRun()'s late-unwind sweep retries
+    }
     return { hadActiveRun };
   }
 

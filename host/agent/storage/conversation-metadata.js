@@ -26,12 +26,20 @@
 // (`sdkSessionRef` below) is recorded only as an opaque id, never resolved
 // or reconstructed from here.
 //
-// Scope note (osf-apply, tasks 2.1/2.2 only): this module defines the
-// schema, its migration, and the app-snapshot builders. It does NOT
-// implement atomic SDK-reference ownership, one-active-run-per-conversation
-// enforcement, deletion tombstones (tasks.md 2.3), or resume-compatibility
-// rejection (2.4) — `sdkSessionRef` and `budgetPolicy` are reserved,
-// versioned fields a later group populates; they stay null/default here.
+// Scope note (osf-apply, tasks 2.1/2.2): this module originally only defined
+// the schema, its migration, and the app-snapshot builders, leaving
+// `sdkSessionRef` reserved/null. Tasks 2.3/2.4 (osf-apply, same change) add:
+//   - `buildSdkSessionRef()` / `SDK_SESSION_REF_STATUS` — the shape a
+//     captured SDK session_id is recorded in (host/agent/session/manager.js's
+//     `claimSdkSessionRef()` is the CAS write path; this module only shapes
+//     the value, never touches storage).
+//   - `assessResumeCompatibility()` — the pure comparison 2.4 requires
+//     ("reject incompatible endpoint/model/skill/cwd/session identity")
+//     before a later run of an already-bound conversation is allowed to pass
+//     `resume` to the SDK at all. Field selection is deliberate — see the
+//     function's own docstring for exactly what is and is not compared, and
+//     why.
+// `budgetPolicy` stays reserved for group 5, untouched here.
 
 import { SESSION_SKILLS_PLUGIN_NAME } from "../skills/session-workspace.js";
 
@@ -188,6 +196,143 @@ export function buildPermissionPolicyIdentity(options) {
  *   `conversationMetadata` envelope.
  * @returns {object} a current-schema conversationMetadata envelope
  */
+// The three states a captured SDK session reference can be in (tasks.md
+// 2.3/2.4/2.5). `sessionId` is NEVER cleared once captured — "never auto-
+// clear a ref on resume failure" (design.md decision 2's tombstone/no-
+// resurrection framing extends to this: a failed resume must not silently
+// discard the one piece of state that makes a later, explicit retry
+// possible). Only `status` (and `updatedAt`) change after the first claim.
+export const SDK_SESSION_REF_STATUS = Object.freeze({
+  // A resume was attempted with this id and the SDK accepted it (or this is
+  // the id captured from a fresh, non-resumed query()'s own init message).
+  ACTIVE: "active",
+  // A resume attempt for this id failed with an explicit "session not
+  // found" signal (gate-0.2 evidence G2: a thrown terminal error AND, where
+  // observed before the throw, a `result` message with
+  // `is_error:true`/`subtype:"error_during_execution"` naming the missing
+  // session id). The conversation's transcript is untouched; only SDK-level
+  // continuity for THIS id is gone.
+  MISSING: "missing",
+  // A resume attempt for this id failed for some other explicit reason (not
+  // the "missing session" shape above) — e.g. an incompatible SDK/CLI
+  // version, a corrupted session file. Distinct from MISSING only so a
+  // later UI/log can say which explicit failure occurred; both states
+  // equally forbid an automatic retry.
+  RESUME_FAILED: "resume_failed"
+});
+
+/**
+ * The shape a captured (or status-updated) SDK session reference takes
+ * inside `conversationMetadata.sdkSessionRef`. Pure — never touches storage;
+ * host/agent/session/manager.js's `claimSdkSessionRef()`/
+ * `markSdkSessionRefStatus()` are the CAS write paths that call this.
+ *
+ * @param {object} params
+ * @param {string} params.sessionId - the SDK's own `session_id` (from the
+ *   `system`/`init` message's `session_id` field, sdk.d.ts ~5207).
+ * @param {string} [params.status] - one of SDK_SESSION_REF_STATUS; defaults
+ *   to ACTIVE (the shape a freshly captured id gets).
+ * @param {object|null} [params.previous] - the prior ref (if any), so
+ *   `capturedAt` survives a status-only update.
+ */
+export function buildSdkSessionRef({ sessionId, status = SDK_SESSION_REF_STATUS.ACTIVE, previous = null } = {}) {
+  if (!sessionId || typeof sessionId !== "string") {
+    throw new Error("buildSdkSessionRef requires a non-empty sessionId string");
+  }
+  const now = Date.now();
+  return {
+    sessionId,
+    status,
+    capturedAt: previous && previous.sessionId === sessionId ? previous.capturedAt : now,
+    updatedAt: now
+  };
+}
+
+/**
+ * The exact field comparison tasks.md 2.4 requires before a later run of an
+ * already-bound conversation may pass `resume` to the SDK: "reject
+ * incompatible endpoint/model/skill/cwd/session identity". Pure function —
+ * no storage access, no side effects.
+ *
+ * Deliberately compares ONLY the fields that can actually vary between two
+ * runs of the same conversation in this codebase's current architecture,
+ * per gate-0.2's own "concrete session-schema-identity inputs" list and this
+ * change's own 2.1/2.2 report:
+ *   - `appProfile.endpoint` / `appProfile.modelId` — the ONE input that can
+ *     genuinely differ turn to turn: the operator can pick a different
+ *     profile/model in the composer for the same conversation's next Send.
+ *   - `sessionSchemaIdentity.cwd` / `.pluginDir` / `.allowedSkillNames` /
+ *     `.skillOverrides` — included because decision 2.4's own text names
+ *     "skill"/"cwd" explicitly; compared for completeness and as a
+ *     forward-compatible guard, even though in today's architecture a
+ *     conversation's `skillsBinding` is bound once
+ *     (SessionManager.setSkillsBinding, "reused verbatim afterward") and
+ *     `cwd` is always `conversationDir(conversationId)` — neither can
+ *     actually drift once `appProfile` (and therefore
+ *     `sessionSchemaIdentity`) has been bound at all, so this branch is
+ *     defensive rather than reachable by today's callers.
+ *
+ * Deliberately EXCLUDED, each for a stated reason:
+ *   - `appProfile.profileId` — two different profile ids can point at the
+ *     identical endpoint+model (e.g. a duplicated profile record); the
+ *     conversation's actual SDK-facing identity is the endpoint+model pair,
+ *     not the application's bookkeeping id for it.
+ *   - `appProfile.credentialRevision` — a rotated credential on the SAME
+ *     endpoint+model is exactly the "current credential" case decision 2.4
+ *     itself calls out ("unavailable current credentials" is the separate
+ *     failure this guards, via `ProfileUnavailableError` — resolved BEFORE
+ *     this check ever runs, since `resolveProfileSnapshot` throws first).
+ *     Comparing credentialRevision here would force a hard, unnecessary
+ *     incompatibility on ordinary key rotation and contradicts "no
+ *     historical-secret reconstruction" (which is about never REBUILDING an
+ *     old credential, not about pinning conversations to one).
+ *   - `permissionPolicy` — decision 2 records it as part of the app
+ *     snapshot, but decision 2.4's own rejection list does not name it, and
+ *     it is entirely DERIVED from `appProfile`/`sessionSchemaIdentity`/the
+ *     fixed isolation contract (buildIsolatedOptions never varies it for a
+ *     given skills+tool registry) — comparing it would be redundant with
+ *     the fields above, never an independent signal.
+ *   - `sessionSchemaIdentity.settingSources` — fixed `[]` unconditionally
+ *     (query-options.js's isolation contract never widens it); comparing a
+ *     constant to itself can never produce a mismatch.
+ *
+ * A `bound.appProfile` of `null` (nothing bound yet — a legacy conversation
+ * or this conversation's very first run) is always reported compatible:
+ * there is nothing to conflict with yet, and binding is `SessionManager
+ * .bindConversationAppSnapshot()`'s job, not this function's.
+ *
+ * @param {object} params
+ * @param {{appProfile: object|null, sessionSchemaIdentity: object|null}} params.bound -
+ *   the conversation's already-recorded identity (getConversationMetadata()).
+ * @param {{appProfile: object, sessionSchemaIdentity: object|null}} params.current -
+ *   this run's freshly resolved identity (buildAppProfileIdentity()/
+ *   buildSessionSchemaIdentity() over THIS run's snapshot/skills).
+ * @returns {{compatible: true} | {compatible: false, mismatches: Array<{field: string, bound: *, current: *}>}}
+ */
+export function assessResumeCompatibility({ bound, current }) {
+  const boundProfile = bound && bound.appProfile;
+  if (!boundProfile) return { compatible: true };
+
+  const currentProfile = (current && current.appProfile) || {};
+  const boundSchema = bound.sessionSchemaIdentity || {};
+  const currentSchema = (current && current.sessionSchemaIdentity) || {};
+
+  const sameArray = (a, b) => JSON.stringify([...(a || [])].sort()) === JSON.stringify([...(b || [])].sort());
+  const sameObject = (a, b) => JSON.stringify(a || {}) === JSON.stringify(b || {});
+
+  const checks = [
+    { field: "endpoint", bound: boundProfile.endpoint ?? null, current: currentProfile.endpoint ?? null, eq: (a, b) => a === b },
+    { field: "modelId", bound: boundProfile.modelId ?? null, current: currentProfile.modelId ?? null, eq: (a, b) => a === b },
+    { field: "cwd", bound: boundSchema.cwd ?? null, current: currentSchema.cwd ?? null, eq: (a, b) => a === b },
+    { field: "pluginDir", bound: boundSchema.pluginDir ?? null, current: currentSchema.pluginDir ?? null, eq: (a, b) => a === b },
+    { field: "allowedSkillNames", bound: boundSchema.allowedSkillNames || [], current: currentSchema.allowedSkillNames || [], eq: sameArray },
+    { field: "skillOverrides", bound: boundSchema.skillOverrides || {}, current: currentSchema.skillOverrides || {}, eq: sameObject }
+  ];
+
+  const mismatches = checks.filter((c) => !c.eq(c.bound, c.current)).map(({ field, bound, current }) => ({ field, bound, current }));
+  return mismatches.length ? { compatible: false, mismatches } : { compatible: true };
+}
+
 export function migrateConversationMetadata(rawMeta) {
   const existing = rawMeta && typeof rawMeta === "object" ? rawMeta.conversationMetadata : null;
   if (existing && existing.schemaVersion === CONVERSATION_METADATA_SCHEMA_VERSION) {
