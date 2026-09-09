@@ -1,0 +1,89 @@
+name: Publish browzy-host to npm
+
+# Publishes host/ (the @huydepzai2810/browzy-host package — the `browzy`
+# install CLI, MCP server, and native messaging host) to npm whenever a
+# version tag is pushed. The test job MUST pass before publish runs: a
+# release that skips its own tests is worse than no release.
+#
+# Requires a repository secret named NPM_TOKEN (an npm automation token with
+# publish rights to the @huydepzai2810 scope). This workflow only ever reads
+# it via `secrets.NPM_TOKEN` — no token value lives in this file.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Run test suites
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      # --legacy-peer-deps is required: the pinned Claude Agent SDK declares
+      # a zod@^4 peer while this project pins zod@^3 (see README's "Install
+      # dependencies" section) — a bare `npm install` fails to resolve on a
+      # clean checkout with no existing node_modules.
+      - name: Install host dependencies
+        working-directory: host
+        run: npm install --legacy-peer-deps
+
+      # host/test/external-mcp-launch-contracts.test.mjs spawns the real
+      # codemode/hybrid servers, which unconditionally try to launch
+      # `wrangler dev` on startup — install the worker's own dependencies so
+      # that spawn has something to find (the test itself never depends on
+      # wrangler reaching "ready", but a missing wrangler binary is a
+      # needless extra failure mode to leave untested).
+      - name: Install codemode worker dependencies
+        working-directory: host/codemode/worker
+        run: npm install
+
+      - name: Run host/ test suite
+        run: |
+          set -e
+          for f in host/test/*.test.mjs; do
+            echo "::group::node $f"
+            node "$f"
+            echo "::endgroup::"
+          done
+
+      - name: Run extension/root test suite
+        run: |
+          set -e
+          for f in test/*.test.mjs; do
+            echo "::group::node $f"
+            node "$f"
+            echo "::endgroup::"
+          done
+
+  publish:
+    name: Publish to npm
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      # No `npm install` needed here: publishing packs host/'s own files (per
+      # its package.json "files" allowlist) and runs no lifecycle scripts —
+      # dependency resolution happens on the INSTALLING machine, not here.
+      - name: Publish (scoped package, public access)
+        working-directory: host
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
