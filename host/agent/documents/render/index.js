@@ -7,12 +7,15 @@
 // mirror of the format list (it must, it runs in another process) but the
 // authority for what `create_document` will accept is this file.
 //
-// The text formats are written directly with no dependency at all — a
-// markdown document is its source bytes. The binary formats (docx, xlsx,
-// pptx, pdf) are generated from the same markdown source by the modules in
-// this directory, each of which loads its generator library lazily: a
-// conversation that only ever produces markdown never pays to load `docx`,
-// `exceljs`, `pptxgenjs` or `pdf-lib`.
+// The tool asks the model for Markdown whatever the format, so `md` and
+// `txt` are stored as written while `csv`, `html` and `json` are converted in
+// render/text.js — a `.csv` full of pipe characters would not be a
+// spreadsheet. The binary formats (docx, xlsx, pptx, pdf) are generated from
+// the same markdown source by the modules in this directory, each of which
+// loads its generator library lazily: a conversation that only ever produces
+// markdown never pays to load `docx`, `exceljs`, `pptxgenjs` or `pdf-lib`.
+
+import { markdownToCsv, markdownToHtml } from "./text.js";
 
 export const DOCUMENT_FORMATS = Object.freeze({
   md: { ext: "md", mimeType: "text/markdown", label: "MD", binary: false },
@@ -49,8 +52,8 @@ export function isSupportedFormat(format) {
  * Produce the bytes of one document.
  *
  * @param {string} format - a key of DOCUMENT_FORMATS
- * @param {string} source - the run's content; markdown for every format
- *   except `json`/`csv`/`txt`/`html`, which are stored as written
+ * @param {string} source - the run's content, written as markdown for every
+ *   format; `json` is the one exception and must be JSON
  * @param {{title: string}} meta
  * @returns {Promise<Buffer>}
  */
@@ -84,13 +87,15 @@ export async function renderDocument(format, source, meta) {
 }
 
 /**
- * Text formats are stored as the run wrote them, with two exceptions that
- * exist to keep the stored file honest about its own extension:
- *   - `html` gets a minimal document wrapper if the run sent a fragment, so
- *     the file opens as a page rather than as loose markup;
- *   - `json` is re-serialized after a parse, so a `.json` file is always
- *     valid JSON — a run that sends prose gets a rejection here rather than
- *     an operator getting a `.json` that no parser accepts.
+ * The text formats.
+ *
+ * `md` and `txt` are their own source and are stored verbatim. The other three
+ * are not: the tool asks the model for Markdown in every case, so a `.csv` or
+ * an `.html` has to be CONVERTED or the stored file would not match the
+ * extension it was given — see render/text.js. `json` is re-serialized after a
+ * parse, so a `.json` file is always valid JSON; a run that sends prose under
+ * that format gets a rejection here rather than an operator getting a file no
+ * parser accepts.
  */
 function normalizeTextSource(format, source, meta) {
   if (format === "json") {
@@ -102,13 +107,7 @@ function normalizeTextSource(format, source, meta) {
     }
     return `${JSON.stringify(parsed, null, 2)}\n`;
   }
-  if (format === "html" && !/<html[\s>]/i.test(source)) {
-    const title = escapeHtml(meta?.title || "Document");
-    return `<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<title>${title}</title>\n</head>\n<body>\n${source}\n</body>\n</html>\n`;
-  }
+  if (format === "csv") return markdownToCsv(source);
+  if (format === "html") return markdownToHtml(source, meta);
   return source.endsWith("\n") ? source : `${source}\n`;
-}
-
-function escapeHtml(s) {
-  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 }

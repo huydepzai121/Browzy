@@ -25,3 +25,18 @@ Later work in this repository, including the Browzy rebrand, file
 attachments, effort control, prompt enhancement, the slash-dispatch and
 session-skills plugin mechanism, provider profile handling and the
 installers, is by Nguyễn Thế Huy.
+
+Bundled third-party fonts
+-------------------------
+
+The host package ships DejaVu Sans (regular and bold) through the
+`dejavu-fonts-ttf` dependency, used to embed a Unicode font in generated PDF
+documents — the PDF standard fonts are WinAnsi-encoded and cannot represent
+Vietnamese at all. DejaVu Fonts are released under the DejaVu Fonts License,
+a free license derived from the Bitstream Vera Fonts Copyright:
+
+    Fonts are (c) Bitstream (see below). DejaVu changes are in public domain.
+    Glyphs imported from Arev fonts are (c) Tavmjong Bah (see below).
+
+The full license text ships with the dependency at
+`node_modules/dejavu-fonts-ttf/LICENSE`.

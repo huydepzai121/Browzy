@@ -105,5 +105,14 @@ vendored dependency at all.
 - npm's `xlsx` package (0.18.5) is stale and carries an unpatched
   prototype-pollution advisory; `exceljs` (MIT, 4.4.0) is used instead on both
   the host and the panel side.
+- `pptxgenjs` pulls in `image-size`, which carries a denial-of-service
+  advisory in its ICNS/JXL/HEIF parsers. That parser only runs when an image is
+  added to a slide, and the deck generator here is built from the run's text
+  alone, so the vulnerable path is not reachable through this code. Recorded
+  rather than dismissed: adding an image to a generated deck later would make
+  it reachable.
+- The PDF path embeds DejaVu Sans (~1.4 MB of TTF in the host package). Not
+  optional: pdf-lib's standard fonts are WinAnsi and throw on the first
+  Vietnamese character. Licensing is recorded in NOTICE.
 - The change spans host, background, and panel. It ships in three commits
   (core path → viewers → binary generators) rather than one diff.

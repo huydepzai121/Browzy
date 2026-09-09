@@ -142,6 +142,50 @@ await test("docx: real OOXML bytes carrying the Vietnamese text", async () => {
   assert(xml.includes("Phân tích"), "the document title is missing from the body");
   assert(xml.includes("Chỉ số"), "the table header cell is missing");
   assert(xml.includes("<w:tbl>"), "the markdown table did not become a real Word table");
+  // Heading levels must survive. An enum lookup that missed would flatten
+  // "## Số liệu" to Heading1 — a document that still passes every text search
+  // while being structurally wrong.
+  assert(/w:val="Heading1"/.test(xml), "no Heading1 style applied");
+  assert(/w:val="Heading2"/.test(xml), "the level-2 heading was flattened to level 1");
+});
+
+await test("csv: a markdown table becomes real RFC 4180 columns", async () => {
+  const buffer = await renderDocument("csv", SOURCE, { title: "Số liệu" });
+  const text = buffer.toString("utf8");
+  const lines = text.split("\r\n").filter(Boolean);
+  assert(lines[0] === "Chỉ số,Giá trị,Ghi chú", `header row was ${JSON.stringify(lines[0])}`);
+  assert(lines[1] === "HTML thô,1350,KB/trang", `first data row was ${JSON.stringify(lines[1])}`);
+  assert(!text.includes("|"), "pipe characters leaked into the csv");
+
+  const tricky = await renderDocument("csv", ["| a | b |", "| --- | --- |", '| x, y | he said "hi" |'].join("\n"), {});
+  const trickyText = tricky.toString("utf8");
+  assert(trickyText.includes('"x, y"'), `a field containing the delimiter was not quoted: ${trickyText}`);
+  assert(trickyText.includes('"he said ""hi"""'), `an embedded quote was not doubled: ${trickyText}`);
+});
+
+await test("csv: a source with no table still yields one column per block", async () => {
+  const buffer = await renderDocument("csv", "# Tiêu đề\n\n- một\n- hai\n", {});
+  const lines = buffer.toString("utf8").split("\r\n").filter(Boolean);
+  assert(lines.length === 3, `expected a row per block, got ${lines.length}`);
+});
+
+await test("html: markdown becomes a real page, and content is escaped rather than trusted", async () => {
+  const buffer = await renderDocument("html", SOURCE, { title: "Phân tích" });
+  const text = buffer.toString("utf8");
+  assert(text.startsWith("<!doctype html>"), "not a complete document");
+  assert(text.includes("<h2>Số liệu</h2>"), "the level-2 heading did not become an h2");
+  assert(text.includes("<table>") && text.includes("<th>Chỉ số</th>"), "the table did not become a real table");
+  assert(text.includes("<strong>H1</strong>"), "bold did not become strong");
+
+  const hostile = await renderDocument("html", "Xin chào <script>alert(1)</script> nhé", { title: "x" });
+  const hostileText = hostile.toString("utf8");
+  assert(!/<script>alert/.test(hostileText), "a script element survived into the html output");
+  assert(hostileText.includes("&lt;script&gt;"), "the script text was not escaped");
+});
+
+await test("html: a run that deliberately writes a full document is stored as written", async () => {
+  const buffer = await renderDocument("html", "<html><body><p>x</p></body></html>", { title: "t" });
+  assert(buffer.toString("utf8").startsWith("<html>"), "a deliberate full document was rewritten");
 });
 
 await test("xlsx: one worksheet per markdown table, numbers stay numeric", async () => {

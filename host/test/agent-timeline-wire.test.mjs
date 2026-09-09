@@ -300,6 +300,102 @@ await test("screenshot artifact: real chunked ingestion + real chunked retrieval
   }
 });
 
+await test("document: a stored document's bytes cross the real wire as a chunked reply and reassemble exactly", async () => {
+  const e2eHome = fs.mkdtempSync(path.join(os.tmpdir(), "ocic-document-wire-e2e-"));
+  const ext = driveHostAsExtension(pipeFor(++seq), e2eHome);
+  try {
+    const helloWaiter = waitForAgentMsg(ext, (e) => e.type === "hello_ack");
+    sendAgentMsg(ext, { v: PROTOCOL_VERSION, type: "hello", ts: Date.now() });
+    await helloWaiter;
+
+    const snapWaiter = waitForAgentMsg(ext, (e) => e.type === "snapshot");
+    sendAgentMsg(ext, { v: PROTOCOL_VERSION, type: "new", ts: Date.now() });
+    const { conversationId } = await snapWaiter;
+
+    // Write the document into the SPAWNED host's own agent home. paths.js
+    // reads OCIC_AGENT_HOME on every call, so pointing this process at the
+    // same directory for the duration of the write is enough — the file the
+    // host serves is the file written here, not a copy.
+    const { DocumentStore } = await import("../agent/documents/store.js");
+    const previousHome = process.env.OCIC_AGENT_HOME;
+    let record;
+    try {
+      process.env.OCIC_AGENT_HOME = e2eHome;
+      // Over one chunk at the module's 700_000-byte default, so the reply is
+      // genuinely multi-part rather than a single envelope that would prove
+      // nothing about the sequence.
+      const body = `# Báo cáo\n\n${"nội dung dài ".repeat(70_000)}`;
+      record = await new DocumentStore().write({ conversationId, title: "Báo cáo dài", format: "md", content: body });
+    } finally {
+      if (previousHome === undefined) delete process.env.OCIC_AGENT_HOME;
+      else process.env.OCIC_AGENT_HOME = previousHome;
+    }
+    assert(record.byteLength > 700_000, `fixture must exceed one chunk, was ${record.byteLength}`);
+    const expectedParts = Math.ceil(record.byteLength / 700_000) + 2; // begin + parts + end
+
+    const replyCollector = collectAgentMsgs(
+      ext,
+      (e) => e.type === "chunk_begin" || e.type === "chunk_part" || e.type === "chunk_end",
+      expectedParts
+    );
+    sendAgentMsg(ext, {
+      v: PROTOCOL_VERSION,
+      type: "document_request",
+      conversationId,
+      documentId: record.documentId,
+      requestId: "doc-wire-1",
+      ts: Date.now()
+    });
+    const replyParts = await replyCollector;
+
+    // The chunk_begin carries what the panel needs to name and type the file
+    // without a second round trip.
+    const begin = replyParts.find((p) => p.type === "chunk_begin");
+    assert(begin.kind === "document_bytes", `chunk kind was ${begin.kind}`);
+    assert(begin.fileName === record.fileName && begin.mimeType === "text/markdown", "the reply is not self-describing");
+
+    const reassembler = new ChunkReassembler();
+    let result = null;
+    for (const part of replyParts) result = reassembler.receive(part);
+    assert(result && result.done, "the document reply sequence must reassemble completely");
+    assert(result.buffer.length === record.byteLength, "reassembled length must match what was stored");
+    assert(result.buffer.toString("utf8").startsWith("# Báo cáo"), "reassembled bytes must be the document");
+  } finally {
+    ext.kill();
+    fs.rmSync(e2eHome, { recursive: true, force: true });
+  }
+});
+
+await test("document: an unknown document resolves to an explicit unavailable envelope, never a stand-in file", async () => {
+  const e2eHome = fs.mkdtempSync(path.join(os.tmpdir(), "ocic-document-missing-e2e-"));
+  const ext = driveHostAsExtension(pipeFor(++seq), e2eHome);
+  try {
+    const helloWaiter = waitForAgentMsg(ext, (e) => e.type === "hello_ack");
+    sendAgentMsg(ext, { v: PROTOCOL_VERSION, type: "hello", ts: Date.now() });
+    await helloWaiter;
+
+    const snapWaiter = waitForAgentMsg(ext, (e) => e.type === "snapshot");
+    sendAgentMsg(ext, { v: PROTOCOL_VERSION, type: "new", ts: Date.now() });
+    const { conversationId } = await snapWaiter;
+
+    const notFoundWaiter = waitForAgentMsg(ext, (e) => e.type === "document");
+    sendAgentMsg(ext, {
+      v: PROTOCOL_VERSION,
+      type: "document_request",
+      conversationId,
+      documentId: "never-created",
+      requestId: "doc-wire-2",
+      ts: Date.now()
+    });
+    const reply = await notFoundWaiter;
+    assert(reply.found === false, "an unknown document must report found:false");
+    assert(reply.reason === "not_found", `reason was ${reply.reason}`);
+  } finally {
+    ext.kill();
+    fs.rmSync(e2eHome, { recursive: true, force: true });
+  }
+});
+
 await test("a missing artifact resolves to an explicit unavailable envelope over the real wire, never a substitute image", async () => {
   const e2eHome = fs.mkdtempSync(path.join(os.tmpdir(), "ocic-timeline-wire-e2e-"));
   const ext = driveHostAsExtension(pipeFor(++seq), e2eHome);

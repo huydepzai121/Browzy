@@ -5,8 +5,6 @@
 
 import { parseMarkdownBlocks, parseInlineRuns } from "./markdown-ast.js";
 
-const HEADING_LEVELS = ["Heading1", "Heading2", "Heading3", "Heading4", "Heading5", "Heading6"];
-
 export async function markdownToDocx(source, meta = {}) {
   const { Document, Packer, Paragraph, TextRun, Table, TableRow, TableCell, HeadingLevel, WidthType, AlignmentType } =
     await import("docx");
@@ -30,7 +28,10 @@ export async function markdownToDocx(source, meta = {}) {
       case "heading":
         children.push(
           new Paragraph({
-            heading: HeadingLevel[HEADING_LEVELS[Math.min(block.level, 6) - 1].toUpperCase()] || HeadingLevel.HEADING_1,
+            // The enum keys are HEADING_1..HEADING_6 — built from the level
+            // directly, never from a derived display name, because a lookup
+            // that misses would silently flatten every heading to level 1.
+            heading: HeadingLevel[`HEADING_${Math.min(Math.max(block.level, 1), 6)}`],
             children: runsFor(block.text, TextRun)
           })
         );

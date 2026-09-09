@@ -6,6 +6,7 @@
 
 .prose {
   color: var(--color-text);
+  font-family: 'JetBrains Mono', monospace;
   font-size: var(--font-size-body);
   line-height: var(--line-height-body);
 }
