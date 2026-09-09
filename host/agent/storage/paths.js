@@ -43,6 +43,18 @@ export function conversationAttachmentsDir(conversationId) {
   return path.join(conversationArtifactsDir(conversationId), "attachments");
 }
 
+// Agent-created documents (the `create_document` tool's output) live in their
+// own subdirectory of the conversation, deliberately outside `artifacts/`:
+// artifacts hold bytes the BROWSER produced (screenshots) or the OPERATOR
+// uploaded (composer attachments), while these are files the RUN produced for
+// the operator to read and download. Keeping the two populations on separate
+// paths means a retention or export rule written for one can never sweep up
+// the other. Same per-conversation privacy and same deleteConversation()
+// cleanup as every other conversation-owned directory.
+export function conversationDocumentsDir(conversationId) {
+  return path.join(conversationDir(conversationId), "documents");
+}
+
 export function conversationEventsFile(conversationId) {
   return path.join(conversationDir(conversationId), "events.jsonl");
 }

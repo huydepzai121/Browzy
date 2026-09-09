@@ -73,6 +73,8 @@ import { RUN_STATES } from "./session/run.js";
 import { TokenBatcher } from "./session/token-batcher.js";
 import { createBrowserMcpServer, SDK_MCP_SERVER_NAME } from "./tools/adapter.js";
 import { createAskUserTool, ASK_USER_TOOL_NAME } from "./tools/ask-the-user.js";
+import { createCreateDocumentTool, CREATE_DOCUMENT_TOOL_NAME } from "./tools/create-document.js";
+import { DocumentStore } from "./documents/store.js";
 import { authorizeBorrowedTabMutation } from "./tools/mapping.js";
 import { buildIsolatedOptions, resolveProfileSnapshot, ProfileUnavailableError } from "./tools/query-options.js";
 import { buildEnhancePrompt, parseEnhanced, buildEnhanceOptions } from "./enhance-prompt.js";
@@ -238,7 +240,7 @@ export class CompanionCore {
    *   one so every existing test double that never passes this stays valid
    *   (additive dependency, same pattern as settingsProvider above).
    */
-  constructor({ toolBridge, sessionManager, lease, coerceArgs, sdk, profileProvider, settingsProvider, artifactStore, attachmentStore, askUserToolFactory }) {
+  constructor({ toolBridge, sessionManager, lease, coerceArgs, sdk, profileProvider, settingsProvider, artifactStore, attachmentStore, askUserToolFactory, documentStore }) {
     this.toolBridge = toolBridge;
     this.sessionManager = sessionManager;
     this.lease = lease;
@@ -247,6 +249,11 @@ export class CompanionCore {
     this.profileProvider = profileProvider;
     this.settingsProvider = settingsProvider || null;
     this.artifactStore = artifactStore || new ActionArtifactStore();
+    // Documents a RUN produced for the operator (the create_document tool).
+    // Distinct store, distinct directory: artifacts are browser/operator
+    // bytes, documents are run output — see storage/paths.js on why the two
+    // populations never share a path.
+    this.documentStore = documentStore || new DocumentStore();
     this.attachmentStore = attachmentStore || new UserAttachmentStore();
     this._settingsModulePromise = null;
     this._unsubscribeCredentialRevoked = null;
@@ -321,6 +328,10 @@ export class CompanionCore {
         return this._handleActionEvent(envelope);
       case AGENT_MESSAGE_TYPES.ACTION_ARTIFACT_REQUEST:
         return this._handleActionArtifactRequest(envelope);
+      case AGENT_MESSAGE_TYPES.DOCUMENT_REQUEST:
+        return this._handleDocumentRequest(envelope);
+      case AGENT_MESSAGE_TYPES.DOCUMENT_LIST_REQUEST:
+        return this._handleDocumentListRequest(envelope);
       case AGENT_MESSAGE_TYPES.CHUNK_BEGIN:
       case AGENT_MESSAGE_TYPES.CHUNK_PART:
       case AGENT_MESSAGE_TYPES.CHUNK_END:
@@ -574,6 +585,76 @@ export class CompanionCore {
     });
     const parts = flattenChunkedMessage(chunked).map((part) => makeEnvelope(part.type, part));
     return { multi: parts };
+  }
+
+  /**
+   * Serve one agent-created document's bytes to the panel, on demand.
+   *
+   * Deliberately the same shape as _handleActionArtifactRequest above rather
+   * than a second, parallel mechanism: a `found:false` reply for anything not
+   * readable (so the card renders as unavailable instead of throwing or
+   * showing a stand-in), and the found bytes re-chunked through
+   * broker/chunked-transport.js so a multi-megabyte document crosses Chrome's
+   * native-messaging size ceiling safely.
+   *
+   * The conversation id is taken from the ENVELOPE and the document is looked
+   * up inside that conversation's own directory, so a panel cannot read one
+   * conversation's document by naming another conversation's id — the id it
+   * sends is the id whose directory is searched, and nothing else is.
+   */
+  _handleDocumentRequest(envelope) {
+    if (!this._requireHello()) return this._notHandshaked(envelope);
+    if (!this._versionOk(envelope)) {
+      return versionMismatchEnvelope("unsupported_version", { requested: envelope.v, inReplyTo: envelope.type });
+    }
+    const { conversationId, documentId, requestId } = envelope;
+    const notFound = (reason) =>
+      makeEnvelope(AGENT_MESSAGE_TYPES.DOCUMENT, { requestId, conversationId, documentId, found: false, reason });
+    if (!conversationId || !documentId) return notFound("missing_id");
+    if (!this.sessionManager.hasConversation(conversationId)) return notFound("unknown_conversation");
+
+    const doc = this.documentStore.read(conversationId, documentId);
+    if (!doc.found) return notFound(doc.reason || "not_found");
+
+    const chunked = chunkBuffer(doc.buffer, {
+      meta: {
+        kind: CHUNK_KINDS.DOCUMENT_BYTES,
+        conversationId,
+        documentId,
+        requestId,
+        mimeType: doc.mimeType,
+        fileName: doc.fileName,
+        format: doc.format,
+        title: doc.title
+      }
+    });
+    const parts = flattenChunkedMessage(chunked).map((part) => makeEnvelope(part.type, part));
+    return { multi: parts };
+  }
+
+  /**
+   * The metadata of every document a conversation holds — no bytes.
+   *
+   * This is what lets a reloaded panel, or a panel opening an older
+   * conversation, rebuild live document cards: the card needs a title, a
+   * format and a byte count, and it needs to know the document is still
+   * readable. Reading the whole file population to answer this would be
+   * pointless work for a card the operator may never click.
+   */
+  _handleDocumentListRequest(envelope) {
+    if (!this._requireHello()) return this._notHandshaked(envelope);
+    if (!this._versionOk(envelope)) {
+      return versionMismatchEnvelope("unsupported_version", { requested: envelope.v, inReplyTo: envelope.type });
+    }
+    const { conversationId, requestId } = envelope;
+    if (!conversationId) {
+      return makeEnvelope(AGENT_MESSAGE_TYPES.DOCUMENT_LIST, { requestId, conversationId, documents: [], reason: "missing_id" });
+    }
+    return makeEnvelope(AGENT_MESSAGE_TYPES.DOCUMENT_LIST, {
+      requestId,
+      conversationId,
+      documents: this.documentStore.list(conversationId)
+    });
   }
 
   /**
@@ -1484,7 +1565,17 @@ export class CompanionCore {
       requestIdTracker: this._pendingQuestions,
       ...(this._askUserToolFactory ? { toolFactory: this._askUserToolFactory } : {})
     });
-    const mcpServer = createBrowserMcpServer({ toolBridge: this.toolBridge, coerceArgs: this.coerceArgs, run, extraTools: [askUserTool] });
+    // The document tool is bound to THIS conversation id, never to one taken
+    // from tool args — that binding is what keeps a run's documents inside its
+    // own conversation directory. Registered on the same server as ask_user,
+    // and named alongside it in extraToolNames below; the two must move
+    // together or the tool is registered but invisible to the model.
+    const createDocumentTool = await createCreateDocumentTool({
+      run,
+      conversationId,
+      store: this.documentStore
+    });
+    const mcpServer = createBrowserMcpServer({ toolBridge: this.toolBridge, coerceArgs: this.coerceArgs, run, extraTools: [askUserTool, createDocumentTool] });
     // Task 9.2 (design.md section 8) + upgrade 3.2/3.3: build a canUseTool
     // callback bound to this run so the SDK routes `computer`/
     // `javascript_tool` calls (which are no longer in allowedTools per task
@@ -1533,7 +1624,7 @@ export class CompanionCore {
         // Registered on the same server just above as an extraTool; named here
         // so the model can actually see and call it. The two must move
         // together — see buildIsolatedOptions' note on extraToolNames.
-        extraToolNames: [ASK_USER_TOOL_NAME],
+        extraToolNames: [ASK_USER_TOOL_NAME, CREATE_DOCUMENT_TOOL_NAME],
         effort,
         resume: resumeSessionId || undefined
       });

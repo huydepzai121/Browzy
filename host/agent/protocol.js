@@ -114,6 +114,24 @@ export const AGENT_MESSAGE_TYPES = Object.freeze({
   ACTION_ARTIFACT_REQUEST: "action_artifact_request",
   ACTION_ARTIFACT: "action_artifact",
 
+  // Document retrieval for the panel's document card (a file produced by the
+  // `create_document` tool). Request carries {conversationId, documentId};
+  // the reply mirrors ACTION_ARTIFACT_REQUEST exactly — EITHER one small
+  // DOCUMENT envelope with found:false (never written, or its bytes are gone
+  // — the "unavailable" state the card must show, never a substitute file)
+  // OR the document's bytes chunked through broker/chunked-transport.js in
+  // wire-arrival order. Reading is the only effect: this message never
+  // creates, edits, or deletes a document.
+  DOCUMENT_REQUEST: "document_request",
+  DOCUMENT: "document",
+
+  // The list of documents a conversation already holds, so a panel that
+  // reloaded (or opened an older conversation) can rebuild its cards without
+  // replaying the whole event stream. Request carries {conversationId}; the
+  // reply carries metadata records only, never bytes.
+  DOCUMENT_LIST_REQUEST: "document_list_request",
+  DOCUMENT_LIST: "document_list",
+
   // Ack for one completed CHUNK_BEGIN/CHUNK_PART*/CHUNK_END sequence whose
   // announced purpose (its chunk_begin's `kind` field) was
   // "action_artifact" — i.e. a screenshot capture's actual bytes finishing
@@ -217,7 +235,12 @@ export const CHUNK_KINDS = Object.freeze({
   // under the conversation's artifacts dir in a subpath DISTINCT from the
   // screenshot artifacts above, so timeline retention never sweeps user
   // bytes (see storage/paths.js's conversationAttachmentsDir).
-  USER_ATTACHMENT: "user_attachment"
+  USER_ATTACHMENT: "user_attachment",
+  // One agent-created document's bytes travelling host -> panel in reply to a
+  // DOCUMENT_REQUEST. Unlike the two kinds above this direction is a READ:
+  // nothing is persisted on arrival, the panel turns the reassembled buffer
+  // into a Blob for the viewer or the download and drops it.
+  DOCUMENT_BYTES: "document_bytes"
 });
 
 // --- START envelope's optional `attachments` field -------------------------
