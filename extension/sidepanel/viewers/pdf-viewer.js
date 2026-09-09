@@ -24,15 +24,21 @@ function loadPdfjs() {
 }
 
 /**
- * Load one document. The caller owns destroying it.
+ * Load one document, returning both the proxy and the loading task.
+ *
+ * The task, not the document proxy, owns teardown: `PDFDocumentProxy` has no
+ * `destroy()` in pdf.js 6 — calling one throws and leaves the worker holding
+ * the document forever, which is exactly what a first pass here did.
  *
  * `bytes` is copied because pdf.js transfers the buffer it is given to its
  * worker, which detaches it — and the same bytes are still needed by the
- * download button and by the Markdown tab.
+ * download button and by the other tab.
  */
 async function openDocument(bytes) {
   const pdfjs = await loadPdfjs();
-  return pdfjs.getDocument({ data: bytes.slice(), isEvalSupported: false, useSystemFonts: true }).promise;
+  const task = pdfjs.getDocument({ data: bytes.slice(), isEvalSupported: false, useSystemFonts: true });
+  const doc = await task.promise;
+  return { doc, task };
 }
 
 /**
@@ -45,7 +51,7 @@ async function openDocument(bytes) {
  *   when the operator closes the viewer mid-way.
  */
 export async function renderPdfPages(bytes, container, { width = 640, signal } = {}) {
-  const doc = await openDocument(bytes);
+  const { doc, task } = await openDocument(bytes);
   try {
     for (let pageNumber = 1; pageNumber <= doc.numPages; pageNumber += 1) {
       if (signal && signal.aborted) return;
@@ -69,7 +75,7 @@ export async function renderPdfPages(bytes, container, { width = 640, signal } =
       page.cleanup();
     }
   } finally {
-    doc.destroy();
+    task.destroy();
   }
 }
 
@@ -81,7 +87,7 @@ export async function renderPdfPages(bytes, container, { width = 640, signal } =
  * lines rather than as one unbroken string.
  */
 export async function pdfToText(bytes) {
-  const doc = await openDocument(bytes);
+  const { doc, task } = await openDocument(bytes);
   try {
     const pages = [];
     for (let pageNumber = 1; pageNumber <= doc.numPages; pageNumber += 1) {
@@ -115,6 +121,6 @@ export async function pdfToText(bytes) {
     }
     return pages.join("\n\n");
   } finally {
-    doc.destroy();
+    task.destroy();
   }
 }

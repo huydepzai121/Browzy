@@ -83,8 +83,8 @@ function runsOf(node) {
   const runs = [];
   for (const run of descendantsNamed(node, "r")) {
     const properties = childrenNamed(run, "rPr")[0] || null;
-    const bold = !!(properties && childrenNamed(properties, "b")[0]);
-    const italic = !!(properties && childrenNamed(properties, "i")[0]);
+    const bold = toggleOn(properties, "b");
+    const italic = toggleOn(properties, "i");
     let text = "";
     for (const child of run.children) {
       if (child.localName === "t") text += child.textContent || "";
@@ -94,6 +94,24 @@ function runsOf(node) {
     if (text) runs.push({ text, bold, italic });
   }
   return runs;
+}
+
+/**
+ * Read one OOXML toggle property (`w:b`, `w:i`).
+ *
+ * Presence alone does NOT mean "on": the schema lets a producer write
+ * `<w:b w:val="false"/>` to switch a toggle OFF against an inherited style,
+ * and the `docx` package this project generates with does exactly that on
+ * every run. Treating presence as truth made every character of a generated
+ * document come out bold AND italic.
+ */
+function toggleOn(properties, localName) {
+  if (!properties) return false;
+  const node = childrenNamed(properties, localName)[0];
+  if (!node) return false;
+  const value = attr(node, "val");
+  if (value === null || value === undefined) return true;
+  return !/^(0|false|off)$/i.test(value.trim());
 }
 
 function tableBlock(node) {

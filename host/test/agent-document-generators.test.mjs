@@ -240,6 +240,42 @@ await test("pdf: a single unbreakable token is wrapped, not overflowed", async (
   assert(pageCount >= 2, `expected the long token to span pages, saw ${pageCount}`);
 });
 
+await test("a document whose content opens with its own title does not carry it twice", async () => {
+  // The model's markdown starts with "# <title>", which is the normal shape of
+  // a report. Adding the card's title on top of that printed it twice.
+  for (const format of ["docx", "pdf"]) {
+    const buffer = await renderDocument(format, SOURCE, { title: "Phân tích dauthau.asia" });
+    if (format === "docx") {
+      const xml = readZipEntry(buffer, (n) => n === "word/document.xml");
+      const occurrences = (xml.match(/Phân tích dauthau.asia/g) || []).length;
+      assert(occurrences === 1, `docx repeated the title ${occurrences} times`);
+      assert(!/w:val="Title"/.test(xml), "the redundant Title paragraph is gone");
+    } else {
+      const { text } = await pdfStructure(buffer);
+      assert(text.length > 0, "pdf re-serialized");
+    }
+  }
+  // With a DIFFERENT title, the heading is still added — the skip is about a
+  // duplicate, not about dropping the title.
+  const xml = readZipEntry(await renderDocument("docx", SOURCE, { title: "Tên khác hẳn" }), (n) => n === "word/document.xml");
+  assert(/Tên khác hẳn/.test(xml), "a title the content does not repeat is still written");
+});
+
+await test("docx runs declare emphasis only where it is on", async () => {
+  const buffer = await renderDocument("docx", "văn bản **đậm** và thường\n", { title: "T" });
+  const xml = readZipEntry(buffer, (n) => n === "word/document.xml");
+  // <w:b w:val="false"/> on every run is what a reader treating presence as
+  // truth misreads as bold — the generator must not emit it at all.
+  assert(!/w:val="false"/.test(xml), "an explicit false toggle was written");
+  assert(xml.includes("<w:b/>"), "the genuinely bold run lost its flag");
+});
+
+await test("pptx titles are real title placeholders, not anonymous text boxes", async () => {
+  const buffer = await renderDocument("pptx", SOURCE, { title: "T" });
+  const xml = readZipEntry(buffer, (n) => n === "ppt/slides/slide1.xml");
+  assert(/type="(ctr)?[Tt]itle"/.test(xml), "the slide title is not a title placeholder");
+});
+
 await test("every binary format round-trips through the store's size guard", async () => {
   const { DocumentStore } = await import("../agent/documents/store.js");
   const store = new DocumentStore();

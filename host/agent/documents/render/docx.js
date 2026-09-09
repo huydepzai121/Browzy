@@ -14,7 +14,16 @@ export async function markdownToDocx(source, meta = {}) {
 
   // The document opens with its own title, so the file is self-describing when
   // opened outside the panel — the card's title is otherwise nowhere in it.
-  if (meta.title) {
+  // Skipped when the content already opens with that same title as its top
+  // heading, which is the common case: a model writing a report starts it with
+  // "# <title>", and adding the title again put it in the file twice.
+  const opensWithTitle =
+    meta.title &&
+    blocks[0] &&
+    blocks[0].type === "heading" &&
+    blocks[0].level === 1 &&
+    normalizeTitle(blocks[0].text) === normalizeTitle(meta.title);
+  if (meta.title && !opensWithTitle) {
     children.push(
       new Paragraph({
         heading: HeadingLevel.TITLE,
@@ -86,13 +95,26 @@ export async function markdownToDocx(source, meta = {}) {
   return Packer.toBuffer(doc);
 }
 
+/** Compare a heading against a title ignoring case, spacing and inline marks. */
+function normalizeTitle(text) {
+  return String(text ?? "")
+    .replace(/[*`_]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
 function runsFor(text, TextRun) {
   return parseInlineRuns(text).map(
     (run) =>
       new TextRun({
         text: run.text,
-        bold: !!run.bold,
-        italics: !!run.italic,
+        // Declared only when true: passing an explicit `false` makes the
+        // library emit <w:b w:val="false"/> on every single run. That is valid
+        // OOXML, but it is also exactly the shape a reader treating presence
+        // as truth misreads as bold — so do not write it at all.
+        ...(run.bold ? { bold: true } : {}),
+        ...(run.italic ? { italics: true } : {}),
         ...(run.code ? { font: "Consolas" } : {})
       })
   );
@@ -106,7 +128,12 @@ function buildTable(block, ctx) {
       children: [
         new Paragraph({
           children: parseInlineRuns(text).map(
-            (run) => new TextRun({ text: run.text, bold: bold || !!run.bold, italics: !!run.italic })
+            (run) =>
+              new TextRun({
+                text: run.text,
+                ...(bold || run.bold ? { bold: true } : {}),
+                ...(run.italic ? { italics: true } : {})
+              })
           )
         })
       ]

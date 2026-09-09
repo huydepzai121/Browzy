@@ -1,48 +1,48 @@
 ## 1. Host: document store and the `create_document` tool
 
-- [ ] 1.1 `host/agent/documents/store.js` — host-minted `docId`, title slugification (`[a-z0-9-]{1,80}`), per-conversation `documents/` dir under the conversation workspace, `<docId>.<ext>` + `<docId>.json` metadata pair, list/read/delete, and the four guards (2 MB source, 10 MB output, 50 docs/conversation, no path escape) ← (verify: `..`, absolute paths, and unicode-only titles all normalize or reject; no write lands outside the conversation dir)
-- [ ] 1.2 `host/agent/tools/create-document.js` — the SDK tool, built on the `ask-the-user.js` shape: zod input `{ title, format?, content }`, host-side write, `run.emit({ type: "document_created", ... })`, plain `CallToolResult` back to the model, exported `CREATE_DOCUMENT_TOOL_NAME`
-- [ ] 1.3 Register in `host/agent/companion.js` alongside `askUserTool` (`extraTools`) AND add the name to `extraToolNames` in the same call — the two must move together or the tool is registered but uncallable
-- [ ] 1.4 Unit tests for store guards and the tool handler (emitted event shape, rejection paths) ← (verify: rejected input never writes a file)
+- [x] 1.1 `host/agent/documents/store.js` — host-minted `docId`, title slugification (`[a-z0-9-]{1,80}`), per-conversation `documents/` dir under the conversation workspace, `<docId>.<ext>` + `<docId>.json` metadata pair, list/read/delete, and the four guards (2 MB source, 10 MB output, 50 docs/conversation, no path escape) ← (verified: `..`, absolute paths and unicode-only titles all normalize or reject; a rejected write leaves no file behind)
+- [x] 1.2 `host/agent/tools/create-document.js` — the SDK tool on the `ask-the-user.js` shape: zod input `{ title, format?, content }`, host-side write, `run.emit({ type: "document_created", ... })`, plain `CallToolResult` back to the model, exported `CREATE_DOCUMENT_TOOL_NAME`
+- [x] 1.3 Registered in `host/agent/companion.js` alongside `askUserTool` AND named in `extraToolNames` in the same call, bound to the calling conversation id rather than to anything in tool args
+- [x] 1.4 Unit tests for store guards and the tool handler — `host/test/agent-documents.test.mjs`, 13/13
 
 ## 2. Bytes transport, host→panel
 
-- [ ] 2.1 Host `document_fetch` wire handler: read the stored file, `chunkBuffer()` with `kind: "document_bytes"`, refuse unknown/foreign `documentId`
-- [ ] 2.2 `extension/background.js` chunk reassembler — the symmetric counterpart of the existing `chunkBytesForWire`, mirroring the host `Reassembler`'s validation (chunkId match, index order, declared total bytes, expiry) ← (verify: out-of-order, duplicated, truncated, and expired sequences are rejected, not silently accepted)
-- [ ] 2.3 Background relay: panel `document_fetch` request → host → reassemble → return bytes to the requesting panel
-- [ ] 2.4 Unit tests for the reassembler against the host chunker's real output ← (verify: round-trip of a multi-chunk buffer is byte-identical)
+- [x] 2.1 Host `document_request` handler: reads the stored file, `chunkBuffer()` with `kind: "document_bytes"`, `found:false` with a reason for anything unreadable
+- [x] 2.2 Chunk reassembler, placed in the PANEL (`extension/sidepanel/chunk-reassembler.js`) rather than in `background.js`: the worker already relays `chunk_*` verbatim, and `chrome.runtime` messaging is JSON, so bytes assembled in the worker could not reach the panel as bytes at all. Mirrors the host reassembler's validation ← (verified: out-of-order, duplicated, truncated and expired sequences are all rejected)
+- [x] 2.3 No background change was needed — `background.js` already relays every agent envelope verbatim in both directions, so the panel speaks `document_request` and consumes the chunked reply directly
+- [x] 2.4 Reassembler tested against the REAL host chunker's output, and the whole reply proven to cross the real native-messaging wire (`host/test/agent-timeline-wire.test.mjs`) ← (verified: a 1.5 MB multi-chunk round trip is byte-identical)
 
 ## 3. Panel: the document card
 
-- [ ] 3.1 `conversation-model.js` — `document_created` becomes a transcript item carrying metadata only
-- [ ] 3.2 `history-store.js` — persist card metadata so a reload rebuilds a live card
-- [ ] 3.3 `sidepanel.js`/`.html`/`.css` — the card: file icon, title, `Document · <FORMAT>` subtitle, Download control; keyboard-reachable, matching the existing panel design tokens
-- [ ] 3.4 `tool-labels.js` — Vietnamese label for `create_document`
-- [ ] 3.5 Download: fetch bytes → `Blob` → `<a download>` object URL, revoked after the click ← (verify: no `downloads` permission added, no network request)
-- [ ] 3.6 Unit tests for the conversation-model item and the persisted-card rehydration ← (verify: a reloaded card still resolves to a fetchable document)
+- [x] 3.1 `conversation-model.js` — `document_created` attaches a metadata-only card to the turn that produced it, replay-safe
+- [x] 3.2 No `history-store.js` change was needed — `applySnapshot()` already rebuilds a conversation from its persisted event stream, so a reloaded panel gets its cards from the replayed `document_created` events
+- [x] 3.3 Card in `sidepanel.js`/`.html`/`.css`: file icon, title, `Tài liệu · <FORMAT> · <size>` subtitle, download control; keyboard-operable, panel design tokens only
+- [x] 3.4 `tool-labels.js` — Vietnamese labels for `create_document` and `ask_user`
+- [x] 3.5 Download: fetch bytes → `Blob` → `<a download>` object URL, revoked after the click ← (verified: no `downloads` permission added, no network request in the path)
+- [x] 3.6 Unit tests for the card item and its replay behaviour — `test/sidepanel-documents.test.mjs`
 
 ## 4. Panel: the two-tab detail viewer
 
-- [ ] 4.1 Modal shell reusing the `attachment-picker-overlay` pattern: title, close, two tabs (Preview / Markdown), Download, focus trap and Esc
-- [ ] 4.2 md/txt/json/csv/html paths — `markdown-lite` for md; `<pre>` for txt/json; table for csv; sandboxed iframe for html
-- [ ] 4.3 Untrusted-HTML rule enforced: every converter's HTML goes into `<iframe sandbox srcdoc>` with neither `allow-scripts` nor `allow-same-origin`; only `markdown-lite` output enters the panel DOM ← (verify: a document containing `<script>` and an `onerror` attribute renders inert)
-- [ ] 4.4 Unit tests for the format→renderer routing table
+- [x] 4.1 Modal shell with title, close, two tabs (Xem trước / Markdown), download, Esc and focus return
+- [x] 4.2 md/txt/json/csv/html paths — markdown-lite for md, `<pre>` for txt/json, a built table for csv, sandboxed iframe for html
+- [x] 4.3 Untrusted-HTML rule enforced: every converter's HTML goes into `<iframe sandbox>` with neither `allow-scripts` nor `allow-same-origin`; only markdown-lite output enters the panel DOM ← (verified in a real browser: a document containing `<script>alert(1)</script>` renders as escaped text)
+- [x] 4.4 Tests for the format→representation routing table
 
 ## 5. Viewers for pdf / docx / xlsx / pptx
 
-- [ ] 5.1 Vendor `pdfjs-dist` (legacy build + worker), `docx-preview`, `mammoth`, `exceljs`, `fflate`, `turndown` under `extension/vendor/`, each loaded by dynamic `import()` only when a document of that format is opened
-- [ ] 5.2 Verify every vendored file against the MV3 CSP (grep `eval(`, `new Function`) and record the result; if a build cannot clear CSP, say so explicitly rather than dropping the format silently ← (verify: grep output recorded per file)
-- [ ] 5.3 Markdown tab for the binary formats: docx → mammoth → turndown; xlsx → GFM pipe tables per sheet; pptx → per-slide outline via fflate + XML; pdf → text layer joined per page
-- [ ] 5.4 Unit tests for each binary→markdown converter against a small fixture of each type ← (verify: fixtures are generated by task 6's generators, not committed binaries)
+- [x] 5.1 Vendored `pdfjs-dist` (legacy build + worker) and `fflate`, each loaded by dynamic `import()` only when a document of that format is opened. `docx-preview`, `mammoth`, `exceljs` and `turndown` were REJECTED after measurement (see 5.2); docx/xlsx/pptx are read with fflate plus the panel's own `DOMParser`, and html→markdown with a DOM walk — which also removes ~1.5 MB from the package
+- [x] 5.2 Every candidate measured against the MV3 CSP rather than trusted: fflate 0 `eval(` / 0 `new Function(`, turndown 0/0, `pdf.min.mjs` 0/0, `pdf.worker.min.mjs` 0/0, **mammoth 0/7**, **exceljs 0/1**. The two with `new Function` are not vendored, and the reason is recorded rather than the format being dropped
+- [x] 5.3 Markdown tab for the binary formats: docx → block extraction → markdown; xlsx → GFM pipe tables per sheet; pptx → per-slide outline; pdf → text layer grouped by baseline, one section per page
+- [x] 5.4 Every converter exercised in a REAL Chrome against fixtures produced by task 6's generators (they need `DOMParser`, which Node lacks), through a throwaway localhost harness serving the real extension modules. That run found and fixed four genuine defects: docx toggles read `w:val="false"` as ON, the docx and pdf title printed twice, pptx titles written as anonymous text boxes instead of title placeholders, and `doc.destroy()` — which pdf.js 6 does not have — hanging every PDF. All four now have regression tests
 
 ## 6. Host generators for docx / xlsx / pptx / pdf
 
-- [ ] 6.1 Add `docx`, `exceljs`, `pptxgenjs`, `pdf-lib` to `host/package.json`; refresh `npm-shrinkwrap.json`
-- [ ] 6.2 `host/agent/documents/render/` — markdown → docx, markdown table → xlsx, markdown outline → pptx, markdown → pdf
-- [ ] 6.3 Unit tests asserting the magic bytes and a round-trip through the task-5 extractors ← (verify: `PK\x03\x04` for the OOXML trio, `%PDF-` for pdf)
+- [x] 6.1 `docx`, `exceljs`, `pptxgenjs`, `pdf-lib`, `@pdf-lib/fontkit`, `dejavu-fonts-ttf` and `fflate` added to `host/package.json`; `npm-shrinkwrap.json` refreshed; font licensing recorded in `NOTICE`
+- [x] 6.2 `host/agent/documents/render/` — markdown → docx, markdown table → xlsx, markdown outline → pptx, markdown → pdf, plus csv and html conversion so a stored file always matches its extension
+- [x] 6.3 Tests assert the magic bytes and read the content back out of the containers — `PK` for the OOXML trio, `%PDF-` for pdf, and Vietnamese text surviving into each ← (verified: 17/17, including that a Unicode font is really embedded in the PDF)
 
 ## 7. Lifetime, cleanup, and acceptance
 
-- [ ] 7.1 Deleting a conversation deletes its `documents/` directory; a card whose file is gone renders as unavailable rather than throwing
-- [ ] 7.2 Full existing suites stay green (`npm test` in `host/`, `test/` extension suites, `test/_extract.mjs` constraints respected)
-- [ ] 7.3 Operator-run live acceptance, NOT claimed done until executed: ask the agent for a report → card appears → open → both tabs render → Download saves a valid file → reload the panel → the card still opens and downloads ← (verify: concrete pass/fail observed in a live browser, per format)
+- [x] 7.1 Deleting a conversation removes its `documents/` directory with the rest of the conversation tree; a card whose file is gone reports `bytes_missing` and renders as unavailable rather than throwing
+- [x] 7.2 Full suites green: every `host/test/agent-*.test.mjs` (30 files), `host` `npm test`, and every `test/sidepanel-*`, `design-tokens-contrast` and `extension-csp-no-inline-scripts` suite. `test/side-panel-group-scope.test.mjs` has 6 failures that pre-date this change (verified against a clean tree)
+- [ ] 7.3 Operator-run live acceptance, NOT claimed done: reload the unpacked extension, ask the agent for a report, confirm the card appears in the panel, both tabs render, Download saves a valid file, and a panel reload leaves the card still openable — once per format. Every layer below this has been exercised (host generators, wire transport, panel modules, and the viewers in a real browser), but the assembled panel UI has not been driven by hand

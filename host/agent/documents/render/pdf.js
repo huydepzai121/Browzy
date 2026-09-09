@@ -44,11 +44,21 @@ export async function markdownToPdf(source, meta = {}) {
   };
   newPage(layout);
 
-  if (meta.title) {
+  const blocks = parseMarkdownBlocks(source);
+  // Skipped when the content already opens with that same title as its top
+  // heading — the common case, since a model writing a report starts it with
+  // "# <title>". Printing both put the title on the page twice.
+  const opensWithTitle =
+    meta.title &&
+    blocks[0] &&
+    blocks[0].type === "heading" &&
+    blocks[0].level === 1 &&
+    normalizeTitle(blocks[0].text) === normalizeTitle(meta.title);
+  if (meta.title && !opensWithTitle) {
     drawWrapped(layout, String(meta.title), { font: bold, size: 20, gapAfter: 10 });
   }
 
-  for (const block of parseMarkdownBlocks(source)) {
+  for (const block of blocks) {
     switch (block.type) {
       case "heading":
         drawWrapped(layout, inlineToPlainText(block.text), {
@@ -90,6 +100,15 @@ export async function markdownToPdf(source, meta = {}) {
   }
 
   return Buffer.from(await pdf.save());
+}
+
+/** Compare a heading against a title ignoring case, spacing and inline marks. */
+function normalizeTitle(text) {
+  return String(text ?? "")
+    .replace(/[*`_]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
 }
 
 function fontPath(file) {

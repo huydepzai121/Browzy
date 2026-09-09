@@ -54,6 +54,14 @@ function readSlide(doc) {
       levels.push(Number.isFinite(level) ? level : 0);
     }
   }
+  // A deck whose shapes carry no title placeholder — which is what a generator
+  // that draws plain text boxes produces, and what several exporters produce —
+  // would otherwise show every slide as an untitled list. The first line of a
+  // slide is what a reader treats as its title anyway, so promote it.
+  if (!title && bullets.length) {
+    title = bullets.shift();
+    levels.shift();
+  }
   return { title, bullets, levels };
 }
 

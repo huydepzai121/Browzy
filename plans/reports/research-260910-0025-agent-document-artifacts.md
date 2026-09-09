@@ -142,3 +142,62 @@ Bổ sung thư viện cho PowerPoint:
 PPTX **không có** trình render trung thực chạy trong trình duyệt. Preview PPTX sẽ
 là bản trích xuất có cấu trúc (tiêu đề + bullet từng slide) — nêu rõ giới hạn này
 trong UI thay vì giả vờ render đầy đủ.
+
+
+---
+
+## 5. Kết quả đo thực tế (2026-09-10, sau khi triển khai)
+
+### 5.1 CSP của MV3 — đo, không tin mô tả
+
+Đếm trực tiếp trên bản build đã tải về:
+
+| Tệp | `eval(` | `new Function(` | Kết luận |
+|---|---|---|---|
+| `fflate.esm.js` (89 KB) | 0 | 0 | ✅ vendor |
+| `turndown.js` (26 KB) | 0 | 0 | không cần nữa (tự viết DOM walk) |
+| `pdf.min.mjs` (506 KB) | 0 | 0 | ✅ vendor |
+| `pdf.worker.min.mjs` (1286 KB) | 0 | 0 | ✅ vendor |
+| `mammoth.browser.min.js` (622 KB) | 0 | **7** | ❌ loại |
+| `exceljs.min.js` (925 KB) | 0 | **1** | ❌ loại |
+
+Vì vậy docx/xlsx/pptx được đọc bằng `fflate` + `DOMParser` sẵn có của panel.
+Đổi lại: gói extension nhẹ hơn ~1,5 MB và không còn rủi ro CSP.
+
+### 5.2 Bốn lỗi thật do kiểm thử trong Chrome phát hiện
+
+Các bộ đọc OOXML cần `DOMParser` nên không chạy được trong Node. Đã dựng một
+server localhost tạm phục vụ chính thư mục `extension/`, nạp module thật trong
+Chrome và chạy chúng trên fixture do generator của host sinh ra:
+
+1. `w:b w:val="false"` bị đọc là **bật** → mọi ký tự của tài liệu Word ra
+   đậm + nghiêng. Sửa cả hai phía: reader tôn trọng thuộc tính `val`,
+   generator không ghi cờ `false` nữa.
+2. Tiêu đề bị in **hai lần** trong docx và pdf (tiêu đề thẻ + `# tiêu đề` của
+   nội dung).
+3. Tiêu đề slide pptx được ghi như hộp văn bản vô danh, không phải
+   `<p:ph type="title"/>` → mọi slide mất tiêu đề khi đọc lại.
+4. `doc.destroy()` — pdf.js 6 không có hàm này — làm **treo mọi lần mở PDF**.
+   Đúng ra phải `loadingTask.destroy()`.
+
+Cả bốn đều đã có test hồi quy.
+
+### 5.3 Kết quả cuối trên Chrome thật
+
+- PDF: dựng ra canvas 400×565 với 226.000 điểm ảnh có mực; trích văn bản giữ
+  nguyên tiếng Việt có dấu.
+- DOCX: đúng một H1, giữ H2, bảng thành `<table>`, đậm chỉ ở chỗ đậm.
+- XLSX: header + ô số 1350 hiển thị đúng, markdown ra bảng GFM.
+- PPTX: slide có tiêu đề thật, markdown ra dạng outline.
+- HTML: `<script>alert(1)</script>` trong tài liệu hiển thị thành văn bản đã
+  escape, không tạo phần tử script nào.
+
+Lưu ý về môi trường kiểm thử: khi tab đang ẩn, Chrome chặn `requestAnimationFrame`
+nên pdf.js không bao giờ hoàn tất render — đó là giới hạn của tab ẩn, không phải
+lỗi sản phẩm; đưa tab ra hiển thị thì render xong ngay.
+
+## Việc còn lại
+
+Chỉ còn một cửa ải: chạy tay trên extension đã nạp lại — hỏi agent tạo một báo
+cáo, xem thẻ hiện trong panel, mở cả hai tab, bấm Tải về, reload panel rồi mở
+lại. Mọi tầng bên dưới đã được kiểm chứng bằng test thật.

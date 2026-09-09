@@ -22,10 +22,26 @@ export async function markdownToPptx(source, meta = {}) {
   pptx.layout = "LAYOUT_16x9";
   if (meta.title) pptx.title = String(meta.title);
 
+  // A master with a real title placeholder, so each slide's title is written
+  // as <p:ph type="title"/> rather than as an anonymous text box. Without it
+  // the title is structurally indistinguishable from a bullet, and any reader
+  // — PowerPoint's own outline view included — loses it.
+  pptx.defineSlideMaster({
+    title: "BROWZY_MASTER",
+    objects: [
+      {
+        placeholder: {
+          options: { name: "title", type: "title", x: 0.5, y: 0.35, w: 9, h: 0.9, fontSize: 28, bold: true, color: "1A1A1A" },
+          text: ""
+        }
+      }
+    ]
+  });
+
   const slides = buildSlideModel(parseMarkdownBlocks(source), meta.title);
   for (const model of slides) {
-    const slide = pptx.addSlide();
-    slide.addText(model.title, { x: 0.5, y: 0.35, w: 9, h: 0.9, fontSize: 28, bold: true, color: "1A1A1A" });
+    const slide = pptx.addSlide({ masterName: "BROWZY_MASTER" });
+    slide.addText(model.title, { placeholder: "title" });
     if (model.bullets.length) {
       slide.addText(
         model.bullets.map((b) => ({ text: b.text, options: { bullet: true, indentLevel: Math.min(b.depth, 4) } })),
