@@ -63,6 +63,25 @@
   let documentEpoch = 0;
   let lastKnownUrl = location.href;
 
+  // Per-document nonce (design.md "upgrade-agent-reliability-and-workflows"
+  // decision 6 / tasks.md 1.2): the content-script half of the document-
+  // identity handshake extension/events/document-identity.js's
+  // DocumentBindingTracker confirms against. Held on the isolated-world
+  // `window` (like `__unblockedChromeLoaded` above) rather than a plain
+  // closure variable so it SURVIVES a content-script re-injection (case 1/2
+  // above — an extension reload while this page stays open) without
+  // minting a spurious "new document" for a document that never actually
+  // changed. It is still genuinely PER-DOCUMENT: the isolated world is
+  // destroyed and rebuilt on every real navigation exactly like the main
+  // world is (gate-1.1 G3/G4: an in-memory value is correctly LOST on tab
+  // close+reopen and on a real browser restart). NEVER put this in
+  // localStorage — G3/G4 both confirmed localStorage (disk-backed, per
+  // origin) wrongly SURVIVES both, which would silently defeat the whole
+  // mechanism. Invisible to page scripts: isolated-world `window`
+  // properties are not reachable from the page's own JS realm.
+  window.__unblockedChromeDocNonce = window.__unblockedChromeDocNonce || crypto.randomUUID();
+  const documentNonce = window.__unblockedChromeDocNonce;
+
   /** Bump the document identity and invalidate every outstanding element
    * ref — real refs, not a copy: deletes each key from the SAME `elementMap`
    * `resolveRef`/`getOrAssignRef` read from, so anything already holding a
@@ -1176,11 +1195,19 @@
       return true;
     }
 
-    // Lightweight document-identity probe — url/title/epoch only, no DOM
-    // text extraction — for callers that need to know whether the document
-    // has changed since a prior capture without re-reading its content.
+    // Lightweight document-identity probe — url/title/epoch/nonce only, no
+    // DOM text extraction — for callers that need to know whether the
+    // document has changed since a prior capture without re-reading its
+    // content. `docNonce` (design.md decision 6 / tasks.md 1.2) is the
+    // content-script half of extension/events/document-identity.js's
+    // handshake; `documentEpoch` remains the separate, pre-existing SPA
+    // ref-invalidation counter (bumps on every route change, including one
+    // that does not change docNonce — see this file's own comment at
+    // `documentNonce`'s definition).
     if (msg.type === "getDocumentIdentity") {
-      sendResponse({ result: { url: location.href, title: document.title || "", documentEpoch, readyState: document.readyState } });
+      sendResponse({
+        result: { url: location.href, title: document.title || "", documentEpoch, docNonce: documentNonce, readyState: document.readyState }
+      });
       return true;
     }
 

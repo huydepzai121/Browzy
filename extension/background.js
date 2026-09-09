@@ -4,6 +4,7 @@
 import * as humanize from "./humanize/index.js";
 import * as audit from "./audit/index.js";
 import * as actionEvents from "./events/action-events.js";
+import * as documentIdentity from "./events/document-identity.js";
 
 // Prevent unhandled rejections from killing the service worker
 self.addEventListener("unhandledrejection", (event) => {
@@ -533,6 +534,16 @@ const cursorByTab = new Map(); // tabId -> { x, y }
 // observe (browser-visible URL changes only — not content.js's own SPA
 // documentEpoch, which is out of this batch's scope).
 const actionDocTracker = new actionEvents.DocumentIdTracker();
+
+// The P0 minimum document identity primitive (design.md decision 6 /
+// tasks.md 1.2-1.3) — see extension/events/document-identity.js's own
+// header for the full contract and the gate-1.1 evidence it is built on.
+// Unlike `actionDocTracker` above (a best-effort action-event id, design.md
+// 5c, never authoritative for anything), this tracker is the one that
+// CONFIRMS identity via the content-script handshake and can fail closed.
+// Later work (groups 2/3/7) wires this into send/lease/read/mutation/
+// approval; this batch only produces and confirms real bindings.
+const documentBindings = new documentIdentity.DocumentBindingTracker();
 
 // One humanization "hand" for the life of the service worker: a seeded rng
 // plus a persona (tempo, steadiness, overshoot). Reused across actions so a
@@ -2233,6 +2244,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   cursorByTab.delete(tabId);
   captureScaleByTab.delete(tabId);
   actionDocTracker.clear(tabId);
+  documentBindings.clear(tabId);
   // Drop any per-tab config override too: tab ids are recycled by the browser,
   // so a stale override would silently apply to an unrelated future tab.
   if (configState.byTab[String(tabId)]) {
@@ -2448,6 +2460,33 @@ async function sendContentMessage(tabId, message) {
     throw new ContentScriptUnavailableError(tabId, message.type);
   }
   return response;
+}
+
+// Complete the document-identity handshake (design.md decision 6 / tasks.md
+// 1.2) for a tab whose current generation is not yet CONFIRMED by
+// `documentBindings`. Deliberately LAZY, not driven eagerly from every
+// onUpdated "loading" event: an eager call would race chrome.tabs.
+// sendMessage against content.js's own document_idle injection timing and
+// produce a spurious failure for an ordinary in-flight navigation. A
+// restricted page (chrome://, the extension gallery, ...) legitimately
+// never answers at all — per decision 6 that is the correct FAIL-CLOSED
+// outcome, not a transient error worth retrying.
+//
+// Returns the confirmed binding, or null if the handshake could not be
+// completed — NEVER a tabId+url-only binding as a substitute.
+async function ensureDocumentBinding(tabId) {
+  const existing = documentBindings.getBinding(tabId);
+  if (existing && existing.confirmed) return existing;
+  try {
+    const reply = await sendContentMessage(tabId, { type: "getDocumentIdentity" });
+    const info = reply && reply.result;
+    if (!info || !info.docNonce) return null;
+    return documentBindings.confirmHandshake(tabId, { url: info.url, docNonce: info.docNonce });
+  } catch {
+    // Content script unreachable (restricted page, or a tab that closed
+    // mid-handshake) — fail closed, never fall back to url-only identity.
+    return null;
+  }
 }
 
 // --- Resolve ref to coordinates ---
@@ -3642,6 +3681,28 @@ const toolHandlers = {
     const { url, tabId } = args;
     if (!(await isInGroup(tabId))) return { content: [{ type: "text", text: `Tab ${tabId} is not in the MCP group.` }] };
 
+    // Correlated navigation semantics (design.md decision 6 / tasks.md 1.3):
+    // this is the ONE privileged, background-script-issued navigate call
+    // site (gate-1.1 finding G6 — only a call issued here, never from page/
+    // content-script context, gets a meaningful browser-level signal at
+    // all). Minting the correlation BEFORE the actual chrome.tabs.* call
+    // below is what lets documentBindings.onNavigationSignal() (the
+    // chrome.tabs.onUpdated listener) recognize the resulting navigation as
+    // authorized instead of an unexpected replacement. `typeof` guards
+    // (rather than a bare `documentBindings` reference) are deliberate:
+    // this method's SHIPPED body is extracted and compiled standalone by
+    // test/navigate-url-scheme.test.mjs with a fixed dependency list that
+    // does not include `documentBindings` — the same discipline
+    // tabs_create_mcp already uses for `currentToolMeta` above.
+    // `isDestinationAllowed` is intentionally the default allow-all: today's
+    // navigate() has no domain/scope constraint of its own beyond the
+    // isInGroup check just above — a real predicate is a workflow/approval
+    // concern (design.md decision 8), out of this task's scope, and this
+    // call never invents one.
+    if (typeof documentBindings !== "undefined" && documentBindings) {
+      documentBindings.beginAuthorizedNavigation(tabId, url === "back" || url === "forward" ? null : url);
+    }
+
     if (url === "back") {
       await chrome.tabs.goBack(tabId);
     } else if (url === "forward") {
@@ -3680,6 +3741,16 @@ const toolHandlers = {
         resolve();
       }, 10000);
     });
+
+    // Complete the document-identity handshake now that the navigation has
+    // settled (design.md decision 6 / tasks.md 1.2) — best-effort: a
+    // restricted destination (chrome://, the extension gallery, ...)
+    // legitimately never confirms, and that is the correct fail-closed
+    // outcome, not a reason to fail this tool call. Same `typeof` guard
+    // discipline as above.
+    if (typeof ensureDocumentBinding !== "undefined") {
+      await ensureDocumentBinding(tabId).catch(() => null);
+    }
 
     const tab = await chrome.tabs.get(tabId);
     const tabs = await chrome.tabs.query({ groupId: tabGroupId });
@@ -6309,8 +6380,20 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
   if (changeInfo.url) recordSwEvent("navigate", tabId, { url: changeInfo.url });
   // Bumps the action-event schema's best-effort document identity (design.md
   // 5c) on every browser-visible URL change, including SPA history-API
-  // navigation the tabs API itself already surfaces here.
-  if (changeInfo.url) actionDocTracker.bump(tabId);
+  // navigation the tabs API itself already surfaces here. ALSO bumps on
+  // `changeInfo.status === "loading"` (gate-1.1 G0c / tasks.md 1.2's fix for
+  // that live defect): Chrome does NOT set `changeInfo.url` for a same-URL
+  // reload (the URL string never changes), so that case was previously
+  // invisible to this tracker even though gate-1.1's G1 independently
+  // confirmed a same-URL reload IS a new document at the browser level.
+  const isNavigationSignal = Boolean(changeInfo.url) || changeInfo.status === "loading";
+  if (isNavigationSignal) actionDocTracker.bump(tabId);
+  // The P0 minimum document binding (design.md decision 6 / tasks.md 1.2):
+  // every navigation-start signal invalidates the previously CONFIRMED
+  // binding and (unless a matching `beginAuthorizedNavigation()` correlation
+  // is live for this tab — see navigate()'s call sites) fires the
+  // replacement/invalidation event for a future consumer (groups 2/3/7).
+  if (isNavigationSignal) documentBindings.onNavigationSignal(tabId, { url: changeInfo.url || null });
 });
 
 // --- Init ---
