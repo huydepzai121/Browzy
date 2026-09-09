@@ -50,6 +50,11 @@
   --color-canvas: #f6f7f9;
   --color-surface: #ffffff; /* slightly raised: cards, composer, menus */
   --color-surface-sunken: #eceef2; /* inputs, code blocks */
+  /* Paper. Deliberately the same in both themes: it backs a rendered document
+     page (a PDF canvas), which pdf.js draws onto transparently — a themed
+     surface there would put dark glyphs on a dark ground. Not a UI surface;
+     never use it for panel chrome. */
+  --color-paper: #ffffff;
   --color-overlay-scrim: rgba(11, 11, 17, 0.34);
 
   /* ---- Color: text ----

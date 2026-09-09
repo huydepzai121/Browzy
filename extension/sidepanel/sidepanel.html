@@ -97,6 +97,30 @@
       </div>
     </div>
   </div>
+  <!-- ======================= Document detail viewer ======================== -->
+  <!-- Opened from a document card in the transcript. Two tabs, Preview and
+       Markdown, for every format. Preview renders inside a sandboxed iframe
+       for any format whose renderer produces HTML — document content is data,
+       never markup the panel executes. -->
+  <div id="document-viewer-overlay" class="document-viewer-overlay" hidden>
+    <div id="document-viewer-modal" class="document-viewer-modal" role="dialog" aria-modal="true" aria-labelledby="document-viewer-title" tabindex="-1">
+      <header class="document-viewer-header">
+        <span class="document-viewer-icon" id="document-viewer-icon"></span>
+        <span class="document-viewer-heading">
+          <span class="document-viewer-title" id="document-viewer-title"></span>
+          <span class="document-viewer-sub" id="document-viewer-sub"></span>
+        </span>
+        <button class="btn-icon" type="button" id="document-viewer-download" aria-label="Tải tài liệu về máy" title="Tải về"></button>
+        <button class="btn-icon" type="button" id="document-viewer-close" aria-label="Đóng trình xem tài liệu" title="Đóng"></button>
+      </header>
+      <div class="document-viewer-tabs" role="tablist" aria-label="Chế độ xem tài liệu">
+        <button class="document-viewer-tab is-active" type="button" role="tab" id="document-tab-preview" aria-selected="true" aria-controls="document-viewer-body">Xem trước</button>
+        <button class="document-viewer-tab" type="button" role="tab" id="document-tab-markdown" aria-selected="false" aria-controls="document-viewer-body">Markdown</button>
+      </div>
+      <div class="document-viewer-note" id="document-viewer-note" hidden></div>
+      <div class="document-viewer-body" id="document-viewer-body" role="tabpanel" tabindex="0"></div>
+    </div>
+  </div>
   </div>
 
   <!-- ======================= History / recordings screen ==================== -->

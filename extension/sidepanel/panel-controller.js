@@ -26,6 +26,7 @@
 //                          STREAM_EVENT when it lands in that conversation
 
 import { ConversationModel } from "./conversation-model.js";
+import { DocumentsClient } from "./documents-client.js";
 import { RUN_PHASE } from "./run-states.js";
 import { buildContextMetadata } from "./context-binding.js";
 import { isProfileComplete, deriveReadinessState, READINESS } from "./profile-cache.js";
@@ -60,6 +61,13 @@ export class PanelController {
     // new conversation/run, never retroactively).
     this._selectedModelId = null;
     this._updateHandlers = new Set();
+    // Document byte fetches (agent-created document cards). Owns its own
+    // request correlation and chunk reassembly; this controller only routes
+    // envelopes into it and exposes fetchDocument() to the view.
+    this.documents = new DocumentsClient({
+      send: ({ conversationId, documentId, requestId }) =>
+        this.protocol.documentRequest({ conversationId, documentId, requestId })
+    });
 
     this.protocol.onEnvelope((env) => this._onEnvelope(env));
     this.protocol.onHandshakeChange(() => this._notify());
@@ -273,7 +281,25 @@ export class PanelController {
     this._notify();
   }
 
+  /**
+   * Fetch one agent-created document's bytes for the card the operator just
+   * opened or downloaded.
+   *
+   * @returns {Promise<{found: true, bytes: Uint8Array, meta: object} | {found: false, reason: string}>}
+   */
+  fetchDocument(documentId, conversationId = this.currentConversationId) {
+    return this.documents.fetch({ conversationId, documentId });
+  }
+
   _onEnvelope(env) {
+    // Document transfers are consumed before the switch below: their reply is
+    // a chunk_begin/chunk_part*/chunk_end sequence plus an occasional
+    // `document` not-found envelope, none of which any conversation model has
+    // an opinion about. handleEnvelope() returns true only for envelopes that
+    // belong to a fetch this panel actually asked for, so an unrelated chunk
+    // sequence (a screenshot artifact reply) still falls through untouched.
+    if (this.documents.handleEnvelope(env)) return;
+
     switch (env.type) {
       case "snapshot": {
         const model = this._getOrCreateModel(env.conversationId);

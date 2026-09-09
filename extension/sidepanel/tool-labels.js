@@ -36,7 +36,13 @@ const STATIC_LABELS_VI = {
   set_tab_focus: "Đã chuyển tab",
   upload_image: "Đã tải ảnh lên",
   retranscribe_recording: "Đã chuyển lại bản ghi thành văn bản",
-  file_upload: "Đã tải tệp lên"
+  file_upload: "Đã tải tệp lên",
+  // Application-owned tools, registered alongside the browser tools on the
+  // same in-process MCP server (host/agent/tools/**). They are not browser
+  // actions, but they arrive on the same tool-call path and would otherwise
+  // show their raw wire names in the timeline.
+  create_document: "Đã tạo tài liệu",
+  ask_user: "Đã hỏi người dùng"
 };
 
 const COMPUTER_ACTION_LABELS_VI = {

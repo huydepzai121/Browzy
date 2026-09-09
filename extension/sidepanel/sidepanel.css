@@ -960,3 +960,194 @@ body {
   margin-top: 2px;
   max-width: 100%;
 }
+
+/* ===================== Agent-created document cards ======================= */
+/* The card a run's create_document call produces, rendered in the transcript
+   in place of dumping a whole report inline. Activating it opens the two-tab
+   detail viewer below; the download control saves the real bytes locally. */
+.doc-card {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  width: 100%;
+  margin-top: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface-sunken);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+  color: inherit;
+  transition: border-color 120ms ease, background 120ms ease;
+}
+.doc-card:hover,
+.doc-card:focus-visible {
+  border-color: var(--color-accent-text);
+  background: var(--color-surface-sunken);
+}
+.doc-card-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 38px;
+  height: 44px;
+  border-radius: var(--radius-sm);
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  color: var(--color-text-secondary);
+}
+.doc-card-main {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.doc-card-title {
+  display: block;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.doc-card-sub {
+  display: block;
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+}
+.doc-card-download {
+  flex: 0 0 auto;
+}
+.doc-card.is-unavailable {
+  cursor: default;
+  opacity: 0.72;
+}
+
+/* ===================== Document detail viewer ============================= */
+.document-viewer-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: stretch;
+  justify-content: center;
+  padding: var(--space-3);
+  background: var(--color-overlay-scrim);
+  z-index: 60;
+}
+.document-viewer-overlay[hidden] {
+  display: none;
+}
+.document-viewer-modal {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  max-height: 100%;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+  overflow: hidden;
+}
+.document-viewer-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  border-bottom: 1px solid var(--color-border);
+}
+.document-viewer-icon {
+  display: flex;
+  color: var(--color-text-secondary);
+}
+.document-viewer-heading {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.document-viewer-title {
+  display: block;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.document-viewer-sub {
+  display: block;
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+}
+.document-viewer-tabs {
+  display: flex;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3) 0;
+  border-bottom: 1px solid var(--color-border);
+}
+.document-viewer-tab {
+  padding: var(--space-2) var(--space-3);
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: none;
+  color: var(--color-text-secondary);
+  font: inherit;
+  cursor: pointer;
+}
+.document-viewer-tab.is-active {
+  color: var(--color-text);
+  border-bottom-color: var(--color-accent-text);
+}
+.document-viewer-note {
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--font-size-small);
+  color: var(--color-text-secondary);
+  background: var(--color-surface-sunken);
+  border-bottom: 1px solid var(--color-border);
+}
+.document-viewer-note[hidden] {
+  display: none;
+}
+.document-viewer-body {
+  flex: 1 1 auto;
+  overflow: auto;
+  padding: var(--space-3);
+}
+.document-viewer-body pre.doc-plain {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  font-size: var(--font-size-small);
+}
+.doc-frame {
+  width: 100%;
+  min-height: 60vh;
+  border: 0;
+  background: var(--color-surface);
+}
+.doc-pdf-page {
+  display: block;
+  margin: 0 auto var(--space-3);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  /* A PDF page is paper, and paper is white in either theme: pdf.js draws
+     onto a transparent canvas, so a themed surface behind it would leave dark
+     text on a dark ground. Expressed as a token so this stylesheet keeps
+     resolving every colour through tokens.css. */
+  background: var(--color-paper);
+}
+.doc-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--font-size-small);
+}
+.doc-table th,
+.doc-table td {
+  border: 1px solid var(--color-border);
+  padding: var(--space-1) var(--space-2);
+  text-align: left;
+  vertical-align: top;
+}
+.doc-table th {
+  background: var(--color-surface-sunken);
+  font-weight: 600;
+}
+.doc-viewer-status {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-small);
+}

@@ -352,6 +352,32 @@ export class ConversationModel {
           ts: Date.now()
         };
         break;
+      // A document the run produced for the operator. The event carries
+      // metadata only — never the bytes — so this is cheap to replay on every
+      // reconnect, and the card fetches the file separately when the operator
+      // actually opens or downloads it (documents-client.js).
+      //
+      // Attached to the TURN rather than pushed as a top-level item so the
+      // card sits with the answer that produced it, the way the transcript
+      // already anchors mid-turn question answers.
+      case "document_created": {
+        const turn = this._turnFor(event.runId, { createIfMissing: true, ts: event.ts });
+        if (!Array.isArray(turn.documents)) turn.documents = [];
+        // Replay-safe: the same event arriving twice (a reconnect snapshot
+        // replaying the run's transcript) must not duplicate the card.
+        if (!turn.documents.some((d) => d.documentId === event.documentId)) {
+          turn.documents.push({
+            documentId: event.documentId,
+            title: event.title,
+            fileName: event.fileName,
+            format: event.format,
+            mimeType: event.mimeType,
+            byteLength: event.byteLength,
+            ts: event.ts || Date.now()
+          });
+        }
+        break;
+      }
       case "recording_complete":
         this.items.push({
           kind: "recording",

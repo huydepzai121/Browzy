@@ -53,6 +53,21 @@ export const MSG = Object.freeze({
   // ERROR path above, which sidepanel.js maps to a "companion needs
   // updating" state.
   ENHANCE_PROMPT: "enhance_prompt",
+  // Agent-created documents (host/agent/protocol.js's DOCUMENT_REQUEST /
+  // DOCUMENT). Additive under the same PROTOCOL_VERSION: an older companion
+  // answers an unknown type through the existing ERROR path, which the panel
+  // already surfaces as "companion needs updating". The bytes themselves come
+  // back as a chunk_begin/chunk_part*/chunk_end sequence, which
+  // background.js already relays verbatim and documents-client.js reassembles.
+  //
+  // protocol.js also defines DOCUMENT_LIST_REQUEST/DOCUMENT_LIST. The panel
+  // does not send it: applySnapshot() already performs a full rebuild from
+  // the conversation's persisted event stream, so a reopened conversation's
+  // document cards come back from the replayed `document_created` events with
+  // no extra round trip. The pair stays host-side for a client that has no
+  // transcript to replay.
+  DOCUMENT_REQUEST: "document_request",
+  DOCUMENT: "document",
   ERROR: "error"
 });
 
@@ -236,6 +251,13 @@ export class ProtocolClient {
    * through onEnvelope() like every other request/reply pair here — this
    * class does not itself interpret it.
    */
+  /** Ask for one document's bytes. The reply is either a chunked sequence or
+   * a `document` envelope with found:false — both correlated by requestId,
+   * both surfacing through onEnvelope() like every other pair here. */
+  documentRequest({ conversationId, documentId, requestId }) {
+    this._send(envelope(MSG.DOCUMENT_REQUEST, { conversationId, documentId, requestId }));
+  }
+
   enhancePrompt({ requestId, op, prompt, profileId, modelId }) {
     const payload = op === "cancel" ? { requestId, op } : { requestId, op, prompt, profileId, modelId };
     this._send(envelope(MSG.ENHANCE_PROMPT, payload));

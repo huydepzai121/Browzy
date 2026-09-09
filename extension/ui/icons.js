@@ -31,6 +31,10 @@ const PATHS = {
   circle: '<circle cx="12" cy="12" r="8" />',
   circleDot: '<circle cx="12" cy="12" r="8" /><circle cx="12" cy="12" r="2.5" fill="currentColor" stroke="none" />',
   page: '<path d="M7 3h7l4 4v14H7Z" /><path d="M14 3v4h4" />',
+  // A page with body lines: the document card's own icon, distinguishable at
+  // 20px from `page` (which marks a web page read, not a produced file).
+  fileText: '<path d="M6 3h8l4 4v14H6Z" /><path d="M14 3v4h4" /><path d="M9 12h6M9 15.5h6M9 8.5h2.5" />',
+  download: '<path d="M12 3v11" /><path d="M8 10.5l4 4l4-4" /><path d="M4 18.5v1a1.5 1.5 0 0 0 1.5 1.5h13a1.5 1.5 0 0 0 1.5-1.5v-1" />',
   click: '<path d="M8 4v5" /><path d="M8 9l7.5 3-3.2 1.3L11 16.5Z" />',
   clock: '<circle cx="12" cy="12" r="9" /><path d="M12 7v5l3.5 2" />',
   scroll: '<rect x="6" y="3" width="12" height="18" rx="2" /><path d="M9 8h6M9 12h6M9 16h3" />',

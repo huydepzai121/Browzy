@@ -18,6 +18,7 @@ import { RUN_PHASE, PHASE_LABEL_VI, BUSY_LABEL_VI, phaseVisualClass } from "./ru
 import { renderMarkdownLite, escapeHtml } from "./markdown-lite.js";
 import { createPanelSkillsClient } from "./skills-client.js";
 import { buildPickerItems, filterPickerItems, parseSlashQuery, buildInvocationText } from "./skills-model.js";
+import { FORMAT_LABELS as DOCUMENT_FORMAT_LABELS, EXTRACTED_PREVIEW_FORMATS, buildPreview, buildMarkdown } from "./document-viewer.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -605,6 +606,10 @@ function renderTurnHtml(turn, { isLatestStreaming, busy = false, elapsedVisible 
   // visually from action-timeline rows by position (immediately after the
   // prose, before the optional turn-status-note) and by a different class.
   const citationHtml = renderAnswerSourceCitation(turn);
+  // Documents this turn produced (create_document). They sit below the prose
+  // and above the busy indicator, so a card appears exactly where the answer
+  // that produced it ends — the same anchoring the citation line uses.
+  const documentsHtml = (turn.documents || []).map(renderDocumentCardHtml).join("");
   // Per-answer footer: quiet copy icon-button plus the turn's response time
   // (reuses timelineDurationLabel, so the footer never disagrees with the
   // action-timeline summary; empty for tool-less turns where no honest
@@ -623,6 +628,7 @@ function renderTurnHtml(turn, { isLatestStreaming, busy = false, elapsedVisible 
         ${answersHtml}
         <div class="prose" style="margin-top:${turn.toolRows.length ? "12px" : "0"}">${renderMarkdownLite(turn.text)}${cursor}</div>
         ${citationHtml}
+        ${documentsHtml}
         ${busyHtml}
         ${note ? `<div class="turn-status-note ${note.cls}">${note.text}</div>` : ""}
         ${copyHtml}
@@ -788,6 +794,62 @@ function formatBusyElapsed(totalSeconds) {
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
+// --- Agent-created document cards -----------------------------------------
+//
+// A run that calls create_document produces a file, and the transcript shows
+// it as a card rather than pasting the whole thing inline. The card carries
+// only what the `document_created` event carried — title, format, size — and
+// the bytes are fetched on demand when the operator opens or downloads it.
+//
+// No third-party storage is involved anywhere in this path: download writes a
+// blob the panel already holds, through an <a download>, which needs no
+// `downloads` permission and makes no network request.
+
+function formatBytes(n) {
+  const bytes = Number(n) || 0;
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(bytes < 10240 ? 1 : 0)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function renderDocumentCardHtml(doc) {
+  const label = (DOCUMENT_FORMAT_LABELS[doc.format] || String(doc.format || "")).toUpperCase();
+  const sub = `Tài liệu · ${label} · ${formatBytes(doc.byteLength)}`;
+  return `<div class="doc-card" role="button" tabindex="0" data-document-id="${escapeHtml(doc.documentId)}"
+      aria-label="Mở tài liệu ${escapeHtml(doc.title)}">
+    <span class="doc-card-icon">${iconMarkup("fileText", { size: 20 })}</span>
+    <span class="doc-card-main">
+      <span class="doc-card-title">${escapeHtml(doc.title)}</span>
+      <span class="doc-card-sub">${escapeHtml(sub)}</span>
+    </span>
+    <button class="btn-icon doc-card-download" type="button" data-download-document-id="${escapeHtml(doc.documentId)}"
+      title="Tải về" aria-label="Tải tài liệu ${escapeHtml(doc.title)} về máy">${iconMarkup("download", { size: 16 })}</button>
+  </div>`;
+}
+
+function wireDocumentCards() {
+  for (const card of el.transcript.querySelectorAll(".doc-card")) {
+    const documentId = card.getAttribute("data-document-id");
+    card.addEventListener("click", (event) => {
+      // The download button lives inside the card; its own handler owns the
+      // click, so opening the viewer must not also fire.
+      if (event.target.closest("[data-download-document-id]")) return;
+      openDocumentViewer(documentId);
+    });
+    card.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      openDocumentViewer(documentId);
+    });
+  }
+  for (const button of el.transcript.querySelectorAll("[data-download-document-id]")) {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      downloadDocument(button.getAttribute("data-download-document-id"));
+    });
+  }
+}
+
 function renderRecordingItemHtml(item) {
   const issue = item.transcriptStatus && item.transcriptStatus !== "ok";
   return `<div class="list-item"><span class="list-item-icon">${iconMarkup("mic", { size: 16 })}</span>
@@ -831,6 +893,7 @@ function renderTranscript() {
   el.transcript.innerHTML = html;
   wireToolRowIcons(model);
   wireThumbButtons();
+  wireDocumentCards();
   wireCopyButtons(model);
   if (preserveScroll) el.panelScroll.scrollTop = el.panelScroll.scrollHeight;
   updateJumpLatest();
@@ -2254,3 +2317,303 @@ if (typeof window !== "undefined") {
     }
   };
 }
+
+// ===================== Document detail viewer ==============================
+//
+// The two-tab modal a document card opens. Preview renders the document;
+// Markdown shows its source, or — for a binary format — the text, tables or
+// slide outline extracted from it, so the content stays readable, copyable and
+// searchable in every format.
+//
+// The safety rule this implements: only markdown-lite output, which escapes
+// every character before formatting, is inserted into the panel's own DOM.
+// Everything a converter produces as HTML goes into an <iframe sandbox srcdoc>
+// with neither allow-scripts nor allow-same-origin, so a <script> or an
+// onerror attribute inside a document is inert and cannot reach the panel,
+// chrome.*, or storage.
+
+const docViewer = {
+  documentId: null,
+  meta: null,
+  bytes: null,
+  tab: "preview",
+  lastFocused: null,
+  // Aborts an in-flight PDF render when the operator closes the viewer or
+  // switches tabs mid-way through a long document.
+  renderAbort: null
+};
+
+function documentViewerElements() {
+  return {
+    overlay: $("document-viewer-overlay"),
+    modal: $("document-viewer-modal"),
+    icon: $("document-viewer-icon"),
+    title: $("document-viewer-title"),
+    sub: $("document-viewer-sub"),
+    note: $("document-viewer-note"),
+    body: $("document-viewer-body"),
+    tabPreview: $("document-tab-preview"),
+    tabMarkdown: $("document-tab-markdown"),
+    download: $("document-viewer-download"),
+    close: $("document-viewer-close")
+  };
+}
+
+/** Metadata for a document id, read from the current conversation's turns. */
+function findDocumentMeta(documentId) {
+  const model = panel.currentModel();
+  if (!model) return null;
+  for (const item of model.items) {
+    for (const doc of item.documents || []) {
+      if (doc.documentId === documentId) return doc;
+    }
+  }
+  return null;
+}
+
+async function openDocumentViewer(documentId) {
+  const meta = findDocumentMeta(documentId);
+  if (!meta) return;
+  const ui = documentViewerElements();
+
+  docViewer.documentId = documentId;
+  docViewer.meta = meta;
+  docViewer.bytes = null;
+  docViewer.tab = "preview";
+  docViewer.lastFocused = document.activeElement;
+
+  ui.icon.innerHTML = iconMarkup("fileText", { size: 20 });
+  ui.download.innerHTML = iconMarkup("download", { size: 16 });
+  ui.close.innerHTML = iconMarkup("close", { size: 16 });
+  ui.title.textContent = meta.title;
+  const label = (DOCUMENT_FORMAT_LABELS[meta.format] || meta.format || "").toUpperCase();
+  ui.sub.textContent = `${meta.fileName} · ${label} · ${formatBytes(meta.byteLength)}`;
+  setDocumentViewerTab("preview");
+  ui.body.textContent = "Đang tải tài liệu…";
+  ui.body.className = "document-viewer-body doc-viewer-status";
+  ui.overlay.hidden = false;
+  ui.modal.focus();
+
+  const result = await panel.fetchDocument(documentId);
+  // The operator may have closed the viewer, or opened another document, while
+  // the bytes were in flight — render only if this is still the open document.
+  if (docViewer.documentId !== documentId) return;
+  if (!result.found) {
+    showDocumentUnavailable(result.reason);
+    return;
+  }
+  docViewer.bytes = result.bytes;
+  renderDocumentTab();
+}
+
+function closeDocumentViewer() {
+  const ui = documentViewerElements();
+  if (docViewer.renderAbort) docViewer.renderAbort.abort();
+  docViewer.renderAbort = null;
+  docViewer.documentId = null;
+  docViewer.meta = null;
+  docViewer.bytes = null;
+  ui.body.innerHTML = "";
+  ui.overlay.hidden = true;
+  if (docViewer.lastFocused && docViewer.lastFocused.focus) docViewer.lastFocused.focus();
+  docViewer.lastFocused = null;
+}
+
+function setDocumentViewerTab(tab) {
+  const ui = documentViewerElements();
+  docViewer.tab = tab;
+  ui.tabPreview.classList.toggle("is-active", tab === "preview");
+  ui.tabMarkdown.classList.toggle("is-active", tab === "markdown");
+  ui.tabPreview.setAttribute("aria-selected", tab === "preview" ? "true" : "false");
+  ui.tabMarkdown.setAttribute("aria-selected", tab === "markdown" ? "true" : "false");
+
+  const extracted = tab === "preview" && docViewer.meta && EXTRACTED_PREVIEW_FORMATS.has(docViewer.meta.format);
+  ui.note.hidden = !extracted;
+  if (extracted) {
+    ui.note.textContent =
+      "Bản xem trước của PowerPoint là nội dung trích xuất (tiêu đề và ý từng slide), không phải bản dựng hình đầy đủ.";
+  }
+}
+
+function showDocumentUnavailable(reason) {
+  const ui = documentViewerElements();
+  ui.body.className = "document-viewer-body doc-viewer-status";
+  ui.body.textContent = `Không mở được tài liệu: ${reason || "không rõ nguyên nhân"}.`;
+}
+
+async function renderDocumentTab() {
+  const ui = documentViewerElements();
+  const meta = docViewer.meta;
+  const bytes = docViewer.bytes;
+  if (!meta || !bytes) return;
+
+  if (docViewer.renderAbort) docViewer.renderAbort.abort();
+  docViewer.renderAbort = new AbortController();
+  const { signal } = docViewer.renderAbort;
+  const documentId = docViewer.documentId;
+  const tab = docViewer.tab;
+
+  ui.body.className = "document-viewer-body doc-viewer-status";
+  ui.body.textContent = "Đang dựng nội dung…";
+
+  const dark =
+    document.documentElement.getAttribute("data-theme") === "dark" ||
+    (!document.documentElement.hasAttribute("data-theme") && matchMedia("(prefers-color-scheme: dark)").matches);
+
+  const view =
+    tab === "preview"
+      ? await buildPreview(meta.format, bytes, { title: meta.title, dark })
+      : await buildMarkdown(meta.format, bytes, { title: meta.title });
+
+  // Same staleness guard as the fetch: a slow conversion must not paint over
+  // whatever the operator switched to in the meantime.
+  if (signal.aborted || docViewer.documentId !== documentId || docViewer.tab !== tab) return;
+
+  ui.body.className = "document-viewer-body";
+  ui.body.innerHTML = "";
+  paintDocumentView(ui.body, view, signal);
+}
+
+function paintDocumentView(container, view, signal) {
+  switch (view.kind) {
+    case "markdown": {
+      // The one representation allowed into the panel's own DOM: every
+      // character of it was escaped before any formatting was applied.
+      const prose = document.createElement("div");
+      prose.className = "prose";
+      prose.innerHTML = renderMarkdownLite(view.text);
+      container.appendChild(prose);
+      break;
+    }
+    case "text": {
+      const pre = document.createElement("pre");
+      pre.className = "doc-plain";
+      pre.textContent = view.text;
+      container.appendChild(pre);
+      break;
+    }
+    case "table": {
+      container.appendChild(buildDocumentTable(view.header, view.rows));
+      break;
+    }
+    case "html": {
+      // Untrusted by definition. No allow-scripts, no allow-same-origin: the
+      // frame cannot run code, cannot reach this document, and cannot read
+      // extension storage.
+      const frame = document.createElement("iframe");
+      frame.className = "doc-frame";
+      frame.setAttribute("sandbox", "");
+      frame.setAttribute("referrerpolicy", "no-referrer");
+      frame.srcdoc = view.html;
+      container.appendChild(frame);
+      break;
+    }
+    case "pdf": {
+      const status = document.createElement("div");
+      status.className = "doc-viewer-status";
+      status.textContent = "Đang dựng trang PDF…";
+      container.appendChild(status);
+      import("./viewers/pdf-viewer.js")
+        .then(({ renderPdfPages }) =>
+          renderPdfPages(view.bytes, container, { width: Math.max(280, container.clientWidth - 24), signal })
+        )
+        .then(() => status.remove())
+        .catch((err) => {
+          status.textContent = `Không dựng được PDF: ${err.message}`;
+        });
+      break;
+    }
+    case "unavailable":
+    default: {
+      const status = document.createElement("div");
+      status.className = "doc-viewer-status";
+      status.textContent = `Không hiển thị được: ${view.reason || "định dạng không hỗ trợ"}.`;
+      container.appendChild(status);
+      break;
+    }
+  }
+}
+
+function buildDocumentTable(header, rows) {
+  const table = document.createElement("table");
+  table.className = "doc-table";
+  const thead = document.createElement("thead");
+  const headRow = document.createElement("tr");
+  for (const cell of header) {
+    const th = document.createElement("th");
+    th.textContent = cell;
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement("tbody");
+  for (const row of rows) {
+    const tr = document.createElement("tr");
+    for (let i = 0; i < header.length; i += 1) {
+      const td = document.createElement("td");
+      td.textContent = row[i] ?? "";
+      tr.appendChild(td);
+    }
+    tbody.appendChild(tr);
+  }
+  table.appendChild(tbody);
+  return table;
+}
+
+/**
+ * Save a document to the operator's machine.
+ *
+ * A blob URL plus `<a download>`: no `downloads` permission, no network
+ * request, and nothing leaves the machine. The URL is revoked right after the
+ * click so the bytes are not pinned in memory by the object URL registry.
+ */
+async function downloadDocument(documentId) {
+  const meta = findDocumentMeta(documentId);
+  if (!meta) return;
+  const result = await panel.fetchDocument(documentId);
+  if (!result.found) {
+    showDocumentUnavailable(result.reason);
+    return;
+  }
+  const blob = new Blob([result.bytes], { type: meta.mimeType || "application/octet-stream" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = meta.fileName || "document";
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 2000);
+}
+
+function wireDocumentViewer() {
+  const ui = documentViewerElements();
+  if (!ui.overlay) return;
+  ui.close.addEventListener("click", closeDocumentViewer);
+  ui.download.addEventListener("click", () => {
+    if (docViewer.documentId) downloadDocument(docViewer.documentId);
+  });
+  ui.tabPreview.addEventListener("click", () => {
+    if (docViewer.tab === "preview") return;
+    setDocumentViewerTab("preview");
+    renderDocumentTab();
+  });
+  ui.tabMarkdown.addEventListener("click", () => {
+    if (docViewer.tab === "markdown") return;
+    setDocumentViewerTab("markdown");
+    renderDocumentTab();
+  });
+  // Clicking the scrim closes; clicking inside the modal does not.
+  ui.overlay.addEventListener("click", (event) => {
+    if (event.target === ui.overlay) closeDocumentViewer();
+  });
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !ui.overlay.hidden) {
+      event.preventDefault();
+      closeDocumentViewer();
+    }
+  });
+}
+
+wireDocumentViewer();
