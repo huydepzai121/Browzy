@@ -28,7 +28,10 @@ import {
   authorizeBorrowedTabMutation,
   isBorrowedTab,
   isBorrowedTabMutationAuthorized,
-  isSendClassCall
+  isSendClassCall,
+  classifySendClassCall,
+  normalizeApprovalArgs,
+  fingerprintNormalizedArgs
 } from "./mapping.js";
 
 export const SDK_MCP_SERVER_NAME = "browzy-in-chrome-browser";
@@ -99,6 +102,64 @@ function borrowedTabMutationErrorResult(err) {
   };
 }
 
+function staleApprovalErrorResult(reason) {
+  return {
+    content: [
+      {
+        type: "text",
+        text: `Error: approval is stale and cannot dispatch (${reason}). The target, document, domain, arguments, scope, nonce, or observed state changed after Allow — request a fresh approval instead of retrying this dispatch.`
+      }
+    ],
+    isError: true
+  };
+}
+
+/**
+ * 3.4 pre-dispatch revalidation for send-class-shaped calls. Runs INSIDE
+ * the tool handler — i.e. after `canUseTool` resolved Allow, immediately
+ * before `toolBridge.call` dispatches to the browser. Verifies:
+ *   1. a single-use approval grant for THIS call's normalized-args
+ *      fingerprint was recorded by the Allow path and has not been consumed
+ *      (catches argument/target swaps between Allow and dispatch, replays,
+ *      and handler invocations that never passed the gate at all);
+ *   2. (then the caller's existing authorizeToolCall + borrowed-tab scope
+ *      checks re-verify run state, lease, and tab scope per dispatch —
+ *      unchanged, they already run here).
+ *
+ * On success for a `computer` call, the grant ALSO lifts the borrowed-tab
+ * read-only default for that tab (the user's explicit Allow IS the explicit
+ * task authorization that default waits for). `javascript_tool` is
+ * deliberately EXCLUDED from that lift — the borrowed-tab scripting
+ * restriction (mapping.js 10.4) is independent of approval text and stays
+ * rejected regardless of any Allow (spec "Borrowed-tab JavaScript").
+ *
+ * @returns {{ ok: true, granted: boolean } | { ok: false, reason: string }}
+ *   `granted` is true only when a single-use grant was consumed for this
+ *   exact call (i.e. the call was gated AND approved); false for non-send
+ *   calls that need no grant.
+ */
+export function verifyPreDispatchApproval({ run, legacyToolName, args }) {
+  // The SAME hint rule as the gate (can-use-tool.js resolveHintFor): an
+  // explicitly provided hint is used as-is, otherwise classification is
+  // hintless. Gate and dispatch must never disagree about what evidence a
+  // call carries — in live traffic the SDK input carries no hint either
+  // way, so both sides are hintless and identical by construction.
+  const hint = args?.targetHint && typeof args.targetHint === "object" ? args.targetHint : null;
+  const classification = classifySendClassCall(legacyToolName, args, hint);
+  if (classification.verdict !== "approve-known" && classification.verdict !== "approve-unknown") {
+    return { ok: true, granted: false };
+  }
+  if (typeof run.consumeApprovalGrant !== "function") {
+    return { ok: false, reason: "approval grants unsupported by this run" };
+  }
+  const fingerprint = fingerprintNormalizedArgs(normalizeApprovalArgs(legacyToolName, args));
+  const grant = run.consumeApprovalGrant(fingerprint);
+  if (!grant.ok) {
+    return { ok: false, reason: grant.reason === "grant_replayed" ? "approval grant already used (replay)" : "no approval grant for these exact arguments (stale or bypassed gate)" };
+  }
+  return { ok: true, granted: true };
+}
+
 /**
  * @param {object} deps
  * @param {import("../broker/tool-bridge.js").ToolBridge} deps.toolBridge
@@ -152,6 +213,38 @@ export function buildSdkTools({ toolBridge, coerceArgs, run }) {
           for (const tabId of _tabIdsForArgs(t.name, coerced)) {
             if (isBorrowedTab(run, tabId) && !isBorrowedTabMutationAuthorized(run, tabId)) {
               authorizeBorrowedTabMutation(run, tabId);
+            }
+          }
+        }
+        // 3.3/3.4: a genuinely approved send-class `computer` call carries
+        // the user's explicit Allow for THIS exact call (proven by the grant
+        // consumed below) — that Allow IS the explicit task authorization
+        // the borrowed-tab read-only default waits for, so it lifts the
+        // default for this dispatch. `javascript_tool` is deliberately
+        // EXCLUDED: the borrowed-tab scripting restriction stays rejected
+        // regardless of any approval text (spec "Borrowed-tab JavaScript" —
+        // enforced by enforceBorrowedTabScope below, which still throws for
+        // unscripted-borrowed-tab calls).
+        //
+        // 3.4 pre-dispatch revalidation: for send-class-shaped calls, a
+        // single-use approval grant for THESE EXACT normalized arguments
+        // must have been recorded by the Allow path (canUseTool) — otherwise
+        // the evidence is stale (or the gate was bypassed) and nothing
+        // dispatches. Non-send calls skip this entirely. Verification runs
+        // here, AFTER the run-state/lease/scope checks above and BEFORE
+        // enforceBorrowedTabScope below, so the lift and the restriction
+        // compose in the right order.
+        if (t.name === "computer" || t.name === "javascript_tool") {
+          const preDispatch = verifyPreDispatchApproval({ run, legacyToolName: t.name, args: coerced });
+          if (!preDispatch.ok) {
+            run.recordRejectedDispatch?.(t.name, coerced, { reason: "stale_approval", detail: { dispatchReason: preDispatch.reason } });
+            return staleApprovalErrorResult(preDispatch.reason);
+          }
+          if (preDispatch.granted && t.name === "computer") {
+            for (const tabId of _tabIdsForArgs(t.name, coerced)) {
+              if (isBorrowedTab(run, tabId) && !isBorrowedTabMutationAuthorized(run, tabId)) {
+                authorizeBorrowedTabMutation(run, tabId);
+              }
             }
           }
         }

@@ -1485,18 +1485,40 @@ export class CompanionCore {
       ...(this._askUserToolFactory ? { toolFactory: this._askUserToolFactory } : {})
     });
     const mcpServer = createBrowserMcpServer({ toolBridge: this.toolBridge, coerceArgs: this.coerceArgs, run, extraTools: [askUserTool] });
-    // Task 9.2 (design.md section 8): build a canUseTool callback bound to
-    // this run so the SDK routes `computer`/`javascript_tool` calls (which
-    // are no longer in allowedTools per task 9.1) through it. The callback
-    // auto-allows a non-send-class call; for a send-class call, it issues an
-    // approval via the existing ApprovalRegistry/Run.issueApproval() and
-    // awaits the panel's matching `approval_decision` (or the 5-minute
-    // timeout). It NEVER resolves null (which the SDK warns would block the
-    // tool indefinitely) and NEVER waits past its documented timeout.
+    // Task 9.2 (design.md section 8) + upgrade 3.2/3.3: build a canUseTool
+    // callback bound to this run so the SDK routes `computer`/
+    // `javascript_tool` calls (which are no longer in allowedTools per task
+    // 9.1) through it. The callback auto-allows a non-send-class call; for
+    // a send-class call, it resolves target evidence (no bridge resolver is
+    // wired here, so refs stay unresolved and take the conservative unknown
+    // path), issues an approval bound to run + domain + document identity +
+    // execution nonce + normalized args + observed state + credential
+    // revision, and awaits the panel's matching `approval_decision` (or the
+    // 5-minute timeout). It NEVER resolves null (which the SDK warns would
+    // block the tool indefinitely) and NEVER waits past its documented
+    // timeout.
+    //
+    // 3.3 evidence sources (each best-effort, never fabricated — absent
+    // fields are simply not bound):
+    //   - domain: this run's bound page hostname from the START envelope's
+    //     context metadata (extension/sidepanel/context-binding.js shape).
+    //   - docIdentity: the tab/url half of minimum document identity. The
+    //     FULL docNonce-confirmed binding lives extension-side
+    //     (extension/events/document-identity.js) and no host channel reads
+    //     it at gate time today — bound here is tabId/url only, and the
+    //     residual (docNonce revalidation at dispatch) is an explicit live
+    //     gate, not claimed by structural tests.
+    //   - credentialRevision: the resolved profile snapshot's revision; a
+    //     rotation/revocation between Allow and dispatch fails the consume.
     const canUseTool = createCanUseTool({
       run,
       approvals: run.approvals,
-      requestIdTracker: this._pendingApprovals
+      requestIdTracker: this._pendingApprovals,
+      approvalContext: {
+        ...(context?.hostname ? { domain: context.hostname } : {}),
+        ...((context?.tabId != null || context?.url) ? { docIdentity: { ...(context.tabId != null ? { tabId: context.tabId } : {}), ...(context.url ? { url: context.url } : {}) } } : {}),
+        ...(snapshot.credentialRevision != null ? { credentialRevision: snapshot.credentialRevision } : {})
+      }
     });
     let options;
     try {

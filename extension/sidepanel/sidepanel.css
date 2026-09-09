@@ -764,6 +764,24 @@ body {
   color: var(--color-text-secondary);
 }
 
+/* Per-answer footer: quiet copy icon-button plus response time, closing each
+ * assistant turn. The button itself reuses .btn .btn-secondary .btn-sm, so
+ * only layout (not another button treatment) lives here. No color literal:
+ * spacing and radius come from the shared tokens. */
+.turn-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+.turn-copy-btn {
+  display: inline-flex;
+  align-items: center;
+}
+.turn-duration {
+  color: var(--color-text-secondary);
+}
+
 /* ========================= Image attachment composer UI ===================== */
 
 .attachment-strip {

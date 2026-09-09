@@ -356,5 +356,36 @@ console.log("== model catalog entries are treated as fully opaque strings (mixed
   );
 }
 
+console.log("== ask-user answers anchor to the asking turn, not the transcript tail ==");
+{
+  const m = new ConversationModel("c10");
+  m.addLocalUserMessage("theo dõi TBMT này");
+  m.applyEvent({ type: "run_created", runId: "rq10" });
+  m.applyEvent({ type: "run_started", runId: "rq10" });
+  const toolUse = (id, name) => ({
+    type: "stream_message",
+    runId: "rq10",
+    message: { type: "assistant", message: { content: [{ type: "tool_use", id, name, input: {} }] } }
+  });
+  m.applyEvent(toolUse("t1", "computer"));
+  m.applyEvent(toolUse("t2", "ask_user"));
+  m.applyEvent({ type: "question_request", runId: "rq10", question: "Chọn loại tài khoản?", header: "Xác nhận", options: [{ label: "Cá nhân" }, { label: "VIP" }], requestId: "q1" });
+  m.recordQuestionAnswer("Cá nhân");
+  const turn = m.items.find((it) => it.kind === "assistant_turn");
+  ok(Array.isArray(turn.questionAnswers) && turn.questionAnswers.length === 1, "the answer is stored on the asking turn");
+  ok(turn.questionAnswers[0].text === "👉 Cá nhân", "the answer text keeps the transcript's picked-option format");
+  ok(turn.questionAnswers[0].afterToolCount === 2, "the answer is pinned after the two tool rows present at answer time");
+  ok(!m.items.some((it) => it.kind === "user" && it.isQuestionAnswer), "no trailing duplicate user item is appended");
+  // A tool row streaming in after the answer must not move the anchor:
+  m.applyEvent(toolUse("t3", "navigate"));
+  ok(turn.toolRows.length === 3 && turn.questionAnswers[0].afterToolCount === 2, "later tool rows do not move the anchor");
+}
+{
+  // Fallback: answering with no asking turn keeps the record, never drops it.
+  const m2 = new ConversationModel("c11");
+  m2.recordQuestionAnswer("VIP");
+  ok(m2.items.some((it) => it.kind === "user" && it.isQuestionAnswer && it.text === "👉 VIP"), "without an asking turn the answer still lands as a trailing user item");
+}
+
 console.log(fail === 0 ? "\nALL SIDEPANEL CONVERSATION-MODEL TESTS PASSED" : `\n${fail} FAILED`);
 process.exit(fail ? 1 : 0);

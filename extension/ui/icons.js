@@ -57,6 +57,9 @@ const PATHS = {
   // entirely.
   image: '<rect x="3" y="4" width="18" height="16" rx="2" /><circle cx="8" cy="9.5" r="1.5" /><path d="M21 16l-5-5L5 20" />',
   attach: '<path d="M17.5 8.5l-7 7a3.5 3.5 0 0 1-5-5l7.5-7.5a2.3 2.3 0 0 1 3.3 3.3l-7.2 7.2a1.1 1.1 0 0 1-1.6-1.6l6.4-6.4" />',
+  // Copy-to-clipboard affordance (per-answer copy button). Outline-only like
+  // the rest of the set: two overlapping rounded rectangles.
+  copy: '<rect x="9" y="9" width="12" height="12" rx="2" /><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />',
   // 8-point filled starburst (busy/working indicator). Deliberate exception
   // to this set's outline convention: the whole path carries the same
   // fill="currentColor" stroke="none" override the dot accents above

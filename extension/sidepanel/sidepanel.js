@@ -586,6 +586,12 @@ function renderTurnHtml(turn, { isLatestStreaming, busy = false, elapsedVisible 
   // the row's visibility toggles (its DOM exists either way so the spec's
   // "expansion state does not alter the underlying record" held both ways).
   const timelineHtml = turn.toolRows.length ? renderTimelineCollapsed(turn) : "";
+  // Mid-turn ask-user answers anchored to this turn (see
+  // recordQuestionAnswer): rendered as user bubbles between the tool timeline
+  // and the prose, i.e. next to the tool call that asked for them. The prose
+  // is cumulative and cannot be split at the answer instant, so the bubble
+  // marks the tool-activity position rather than a point inside the text.
+  const answersHtml = (turn.questionAnswers || []).map((a) => renderUserItemHtml({ text: a.text })).join("");
   // Source citation line (task 1.3 / spec "Structured answer with source
   // line"): when this turn actually read a page (a `get_page_text` or
   // `read_page` tool row resolved with a `resultSummary` containing the
@@ -599,14 +605,27 @@ function renderTurnHtml(turn, { isLatestStreaming, busy = false, elapsedVisible 
   // visually from action-timeline rows by position (immediately after the
   // prose, before the optional turn-status-note) and by a different class.
   const citationHtml = renderAnswerSourceCitation(turn);
+  // Per-answer footer: quiet copy icon-button plus the turn's response time
+  // (reuses timelineDurationLabel, so the footer never disagrees with the
+  // action-timeline summary; empty for tool-less turns where no honest
+  // duration exists). No model name by design.
+  const durationLabel = timelineDurationLabel(turn);
+  const durationHtml = durationLabel
+    ? `<span class="turn-duration">${escapeHtml(durationLabel)}</span>`
+    : "";
+  const copyHtml = turn.text
+    ? `<div class="turn-actions"><button class="btn btn-secondary btn-sm turn-copy-btn" type="button" data-run-id="${escapeHtml(String(turn.runId ?? ""))}" title="Sao chép phản hồi" aria-label="Sao chép phản hồi">${iconMarkup("copy", { size: 14 })}</button>${durationHtml}</div>`
+    : "";
   return `
     <div class="msg-row from-assistant">
       <div class="msg-assistant-body">
         ${timelineHtml}
+        ${answersHtml}
         <div class="prose" style="margin-top:${turn.toolRows.length ? "12px" : "0"}">${renderMarkdownLite(turn.text)}${cursor}</div>
         ${citationHtml}
         ${busyHtml}
         ${note ? `<div class="turn-status-note ${note.cls}">${note.text}</div>` : ""}
+        ${copyHtml}
       </div>
     </div>`;
 }
@@ -812,6 +831,7 @@ function renderTranscript() {
   el.transcript.innerHTML = html;
   wireToolRowIcons(model);
   wireThumbButtons();
+  wireCopyButtons(model);
   if (preserveScroll) el.panelScroll.scrollTop = el.panelScroll.scrollHeight;
   updateJumpLatest();
 }
@@ -895,6 +915,69 @@ function wireThumbButtons() {
   // (no live browser to actually capture/store an image this session) —
   // see reports/05-panel-evidence.md. Intentionally not wired to a fake
   // image to avoid claiming capability this task cannot exercise for real.
+}
+
+// Clipboard write with legacy fallback (same convention as spec-ade's chat
+// UI: navigator.clipboard first, document.execCommand('copy') for insecure
+// contexts). Returns true when the text is on the clipboard.
+async function copyTextToClipboard(text) {
+  try {
+    if (typeof navigator !== "undefined" && navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Fall through to the legacy path below.
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = typeof document.execCommand === "function" && document.execCommand("copy");
+    ta.remove();
+    return !!ok;
+  } catch {
+    return false;
+  }
+}
+
+function wireCopyButtons(model) {
+  // runId -> raw turn text, rebuilt on every render like wireToolRowIcons'
+  // flat row list (renderTranscript replaces innerHTML wholesale, so
+  // listeners are always attached fresh — no wiring sentinel needed).
+  const textByRunId = new Map();
+  for (const item of model.items) {
+    if (item.kind === "assistant_turn" && item.runId != null && typeof item.text === "string" && item.text) {
+      textByRunId.set(String(item.runId), item.text);
+    }
+  }
+  el.transcript.querySelectorAll(".turn-copy-btn").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const text = textByRunId.get(btn.getAttribute("data-run-id"));
+      if (!text) return;
+      const ok = await copyTextToClipboard(text);
+      const original = btn.innerHTML;
+      const originalTitle = btn.getAttribute("title");
+      btn.innerHTML = iconMarkup("check", { size: 14 });
+      btn.setAttribute("title", ok ? "Đã sao chép" : "Sao chép thất bại");
+      btn.setAttribute("aria-label", ok ? "Đã sao chép" : "Sao chép thất bại");
+      btn.disabled = true;
+      setTimeout(() => {
+        if (btn.isConnected) {
+          btn.innerHTML = original;
+          if (originalTitle != null) {
+            btn.setAttribute("title", originalTitle);
+            btn.setAttribute("aria-label", originalTitle);
+          }
+          btn.disabled = false;
+        }
+      }, 1500);
+    });
+  });
 }
 
 function emptyStateHtml() {

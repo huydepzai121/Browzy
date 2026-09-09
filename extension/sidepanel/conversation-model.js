@@ -191,6 +191,13 @@ export class ConversationModel {
         runId,
         toolRows: [],
         text: "",
+        // Mid-turn answers to ask-user questions, in answer order:
+        // {text, afterToolCount, ts}. Rendered right after the tool timeline
+        // (before the prose), so a pick sits next to the tool call that asked
+        // for it instead of trailing the whole turn. Local-only like the old
+        // trailing bubble: a snapshot rebuild replays host events only, so
+        // answers are not resurrected after a reconnect — same as before.
+        questionAnswers: [],
         lifecycle: "created", // created|queued|running|stopping|stopped|done|error|interrupted
         complete: false,
         errorInfo: null,
@@ -375,12 +382,23 @@ export class ConversationModel {
     this.pendingQuestion = null;
   }
 
-  /** Task 9.7: record the user's chosen option(s) as a transcript entry so
-   * the conversation history shows exactly which option was picked. */
+  /** Task 9.7: record the user's chosen option(s) anchored to the turn that
+   * asked for them, so the transcript shows the pick right after the
+   * ask-user tool call instead of trailing the whole turn (and everything
+   * streamed after it). `afterToolCount` pins the position against later
+   * tool rows. Falls back to the legacy trailing user item only when the
+   * asking turn cannot be found, so the record is never silently dropped. */
   recordQuestionAnswer(answer) {
     const chosen = Array.isArray(answer) ? answer : [answer];
     const text = chosen.length === 0 ? "(người dùng không chọn)" : `👉 ${chosen.join(", ")}`;
-    this.items.push({ kind: "user", text, ts: Date.now(), runId: this.pendingQuestion?.runId ?? null, isQuestionAnswer: true });
+    const runId = this.pendingQuestion?.runId ?? null;
+    const turn = runId != null ? this._turnsByRunId.get(runId) : null;
+    if (turn) {
+      if (!Array.isArray(turn.questionAnswers)) turn.questionAnswers = [];
+      turn.questionAnswers.push({ text, afterToolCount: turn.toolRows.length, ts: Date.now() });
+      return;
+    }
+    this.items.push({ kind: "user", text, ts: Date.now(), runId, isQuestionAnswer: true });
   }
 
   _applyStreamMessage(runId, message, ts) {

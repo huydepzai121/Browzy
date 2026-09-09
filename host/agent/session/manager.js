@@ -11,8 +11,10 @@ import crypto from "node:crypto";
 
 import { Run, RUN_STATES } from "./run.js";
 import { PendingRecordingsStore } from "../storage/pending-recordings.js";
+import { UsageLedger } from "../storage/usage-ledger.js";
+import { RecordingAttachmentsStore, RECORDING_ATTACHMENT_STATES } from "../storage/recording-attachments.js";
 import { sanitizeActionEvent, PerStreamSeqTracker } from "../storage/action-timeline.js";
-import { migrateConversationMetadata, buildSdkSessionRef, SDK_SESSION_REF_STATUS } from "../storage/conversation-metadata.js";
+import { migrateConversationMetadata, buildSdkSessionRef, SDK_SESSION_REF_STATUS, validateBudgetPolicy } from "../storage/conversation-metadata.js";
 
 export function newConversationId() {
   return `conv_${crypto.randomBytes(9).toString("hex")}`;
@@ -29,8 +31,16 @@ export class SessionManager {
    *   so tests can point it at a scratch file. Optional/additive: existing
    *   call sites that never pass this dep are unaffected unless they call
    *   recordRecordingComplete()/listPendingRecordings() (task 6.3).
+   * @param {import("../storage/usage-ledger.js").UsageLedger} [deps.usageLedger] -
+   *   tasks.md 5.3/5.4: the epoch-based usage ledger. Defaults to a real
+   *   ledger over the standard agent-root path; injectable so tests can point
+   *   it at a scratch root. Constructor never touches disk either way.
+   * @param {import("../storage/recording-attachments.js").RecordingAttachmentsStore} [deps.recordingAttachments] -
+   *   tasks.md 6.1/6.3/6.4: the durable recording-attachment claim store.
+   *   Defaults to a real store over the standard agent-root path; injectable
+   *   so tests can point it at a scratch file. Constructor never touches disk.
    */
-  constructor({ store, lease, approvals, pendingRecordings, releaseNativeLease }) {
+  constructor({ store, lease, approvals, pendingRecordings, usageLedger, recordingAttachments, releaseNativeLease }) {
     this.store = store;
     this.lease = lease;
     this.approvals = approvals;
@@ -39,6 +49,8 @@ export class SessionManager {
     // undefined in tests, where there is no pipe to talk to.
     this.releaseNativeLease = releaseNativeLease;
     this.pendingRecordings = pendingRecordings || new PendingRecordingsStore();
+    this.usageLedger = usageLedger || new UsageLedger();
+    this.recordingAttachments = recordingAttachments || new RecordingAttachmentsStore();
     this._activeRuns = new Map(); // conversationId -> Run
     // Explicit-delete tombstones (task: close reports/05-panel-evidence.md's
     // "No DELETE_CONVERSATION message type" gap, "handled explicitly, not
@@ -365,6 +377,117 @@ export class SessionManager {
   }
 
   /**
+   * This conversation's configured usage policy (tasks.md 5.1), or null for
+   * an unknown/deleted conversation. Never a fabricated limit: unset fields
+   * read back as null.
+   */
+  getBudgetPolicy(conversationId) {
+    const current = this.getConversationMetadata(conversationId);
+    return (current && current.budgetPolicy) || null;
+  }
+
+  /**
+   * Persist a validated usage policy for this conversation (tasks.md 5.1).
+   * Rejects out-of-range/unknown fields rather than storing a lie.
+   * @returns {{ok: true, policy: object} | {ok: false, reason: string}}
+   */
+  setBudgetPolicy(conversationId, policy) {
+    if (this._deletedConversations.has(conversationId)) return { ok: false, reason: "conversation_deleted" };
+    const validated = validateBudgetPolicy(policy);
+    if (!validated.ok) return validated;
+    const current = this.getConversationMetadata(conversationId);
+    if (!current) return { ok: false, reason: "unknown_conversation" };
+    const next = { ...current, budgetPolicy: validated.policy };
+    this.store.updateMeta(conversationId, { conversationMetadata: next });
+    return { ok: true, policy: validated.policy };
+  }
+
+  /**
+   * Start a new usage epoch for this conversation (tasks.md 5.4): SDK totals
+   * reset on resume/clear (gate-0.2 G10), so the ledger must stop differencing
+   * against pre-reset cumulatives. Bumps BOTH the ledger file's epoch and
+   * conversationMetadata.usageEpoch together; the old epoch's pending rows
+   * stay pending/unknown in place (usage-ledger.js never migrates or zeroes
+   * them). Returns the new epoch, or null for an unknown/deleted conversation.
+   */
+  bumpUsageEpoch(conversationId, reason = null) {
+    if (this._deletedConversations.has(conversationId)) return null;
+    const current = this.getConversationMetadata(conversationId);
+    if (!current) return null;
+    const epoch = this.usageLedger.beginEpoch(conversationId, reason);
+    const next = { ...current, usageEpoch: epoch };
+    this.store.updateMeta(conversationId, { conversationMetadata: next });
+    this.store.appendEvent(conversationId, { type: "usage_epoch_started", epoch, reason });
+    return epoch;
+  }
+
+  /**
+   * Phase-1 recording claim for an explicitly selected IDLE conversation
+   * (tasks.md 6.3): `selected -> attached`, verified and idempotent.
+   *
+   * Fail-closed in this order: unknown/deleted conversation, conversation
+   * with an ACTIVE run (only idle conversations may be selected — never
+   * route one conversation's claim into another's live run), missing pending
+   * reference, attachment-store conflict. The pending reference is removed
+   * only after the `attached` state is durably persisted (the store's own
+   * attach() orders it that way); a removal failure still leaves the claim
+   * attached, and the stale pending entry is dropped here on the next claim
+   * attempt for the same recording.
+   *
+   * @returns {{ok: true, record: object, idempotent?: boolean} | {ok: false, reason: string}}
+   */
+  async claimPendingRecording({ recordingId, conversationId, idempotencyKey }) {
+    if (this._deletedConversations.has(conversationId) || !this.store.loadMeta(conversationId)) {
+      return { ok: false, reason: "unknown_conversation" };
+    }
+    if (this.hasActiveRun(conversationId)) {
+      return { ok: false, reason: "conversation_not_idle" };
+    }
+    const pending = this.pendingRecordings.get(String(recordingId));
+    const selected = this.recordingAttachments.select({ recordingId, conversationId, idempotencyKey });
+    if (!selected.ok) return { ok: false, reason: selected.reason };
+    if (!pending) {
+      // No pending reference: either already consumed by an earlier attach
+      // (idempotent re-claim — the store answers from durable state) or a
+      // genuinely unknown recording.
+      const existing = this.recordingAttachments.get(String(idempotencyKey));
+      if (existing && existing.state !== RECORDING_ATTACHMENT_STATES.SELECTED) {
+        return { ok: true, idempotent: true, record: existing };
+      }
+      if (existing) {
+        await this.recordingAttachments.markFailed(String(idempotencyKey), "recording_pending_reference_missing");
+        return { ok: false, reason: "recording_pending_reference_missing" };
+      }
+      return { ok: false, reason: "recording_pending_reference_missing" };
+    }
+    const attached = await this.recordingAttachments.attach(String(idempotencyKey), {
+      verify: ({ recordingId: rid, conversationId: cid }) => {
+        if (!this.store.loadMeta(cid) || this._deletedConversations.has(cid)) {
+          return { ok: false, reason: "unknown_conversation" };
+        }
+        if (this.hasActiveRun(cid)) return { ok: false, reason: "conversation_not_idle" };
+        const ref = this.pendingRecordings.get(String(rid));
+        if (!ref) return { ok: false, reason: "recording_pending_reference_missing" };
+        return {
+          ok: true,
+          integrity: { path: ref.path || null, schema: ref.schema || "v0", transcriptStatus: ref.transcriptStatus || "ok" }
+        };
+      },
+      consumePending: (rid) => this.pendingRecordings.remove(String(rid))
+    });
+    if (!attached.ok) return { ok: false, reason: attached.reason };
+    const record = attached.record;
+    if (this._deletedConversations.has(conversationId)) return { ok: false, reason: "conversation_deleted" };
+    this.store.appendEvent(conversationId, {
+      type: "recording_attachment",
+      recordingId: record.recordingId,
+      idempotencyKey: record.idempotencyKey,
+      state: record.state
+    });
+    return { ok: true, idempotent: !!attached.idempotent, record };
+  }
+
+  /**
    * Every currently active (queued or running) run started by THIS process
    * for the given profileId — used to cancel runs when their credential is
    * revoked (host/agent/companion.js's onCredentialRevoked wiring; design.md
@@ -441,15 +564,19 @@ export class SessionManager {
    *     lives under `skills.configDir` (= `${conversationDir}/claude-config`)
    *     — both are inside the directory this method removes, so no separate
    *     step is needed.
-   *   - "Ledger" (group 5's usage ledger) does not exist yet — nothing to
-   *     remove.
+   *   - "Ledger" is this manager's own `usageLedger` per-conversation file
+   *     (tasks.md 5.3/5.4: `usage/<conversationId>.json`) — removed here via
+   *     `deleteForConversation()`, alongside the directory, so no usage row
+   *     survives its conversation.
    *   - "Recording claims": `PendingRecordingsStore` is companion-wide, not
    *     conversation-owned, and only ever holds a recording BEFORE any
-   *     conversation has claimed it (see its own file header) — once
-   *     attached, a recording becomes a `recording_complete` transcript
-   *     event, which lives inside (and is removed with) this same
-   *     directory. There is no conversation-scoped "claim" state anywhere
-   *     else to clean up.
+   *     conversation has claimed it — once attached, a recording becomes a
+   *     `recording_complete`/`recording_attachment` transcript event, which
+   *     lives inside (and is removed with) this same directory. The durable
+   *     claim records in `RecordingAttachmentsStore` ARE conversation-owned,
+   *     so they are swept here via `deleteForConversation()`; unclaimed
+   *     pending references are intentionally untouched (they belong to no
+   *     conversation).
    *   - "Conversation-owned artifacts" (screenshots, user attachments) live
    *     under `conversationArtifactsDir(conversationId)`, itself inside
    *     `conversationDir(conversationId)` — removed by the same rmSync.
@@ -484,6 +611,18 @@ export class SessionManager {
     this._activeRuns.delete(conversationId);
     this._actionEventCursors.delete(conversationId);
     this._actionEventCursorsSeeded.delete(conversationId);
+    // Conversation-owned P1 state goes with it (see the method docstring):
+    // the usage ledger file and every durable recording-attachment claim.
+    try {
+      this.usageLedger.deleteForConversation(conversationId);
+    } catch {
+      // best-effort — the tombstone above already commits the delete
+    }
+    try {
+      this.recordingAttachments.deleteForConversation(conversationId);
+    } catch {
+      // best-effort — see above
+    }
     try {
       this.store.deleteConversation(conversationId);
     } catch {
@@ -526,22 +665,41 @@ export class SessionManager {
    * or lists the same recording twice — a reconnecting panel resyncing via
    * its normal afterSeq cursor therefore never sees a duplicate either.
    *
+   * Tasks.md 6.3 reconciliation order: an OPEN attachment claim for this
+   * recording (a panel-selected idle conversation, recorded durably in
+   * recording-attachments.js) wins over active-run routing — completion with
+   * no active run reconciles to the SELECTED owner rather than an arbitrary
+   * run, and even when a run IS active a prior explicit selection is still
+   * the least ambiguous target. Only when no open claim exists does the
+   * lease/active-run heuristic below apply.
+   *
    * @returns {string|null} the conversationId it was attached to, or null
    *   when it was persisted to the pending list instead.
    */
   recordRecordingComplete(recording) {
+    const recordingId = recording && recording.recordingId;
+    const openClaim = recordingId ? this.recordingAttachments.findOpenClaimForRecording(String(recordingId)) : null;
+    if (openClaim && this.store.loadMeta(openClaim.conversationId) && !this._deletedConversations.has(openClaim.conversationId)) {
+      this._appendRecordingToConversation(openClaim.conversationId, recording);
+      return openClaim.conversationId;
+    }
     const conversationId = this.activeConversationIdForRecording();
     if (!conversationId) {
       this.pendingRecordings.add(recording);
       return null;
     }
+    this._appendRecordingToConversation(conversationId, recording);
+    return conversationId;
+  }
+
+  /** Idempotent transcript append shared by both routing branches above. */
+  _appendRecordingToConversation(conversationId, recording) {
     const alreadyRecorded = this.store
       .eventsAfter(conversationId, 0)
       .some((e) => e.type === "recording_complete" && e.recordingId === recording.recordingId);
     if (!alreadyRecorded) {
       this.store.appendEvent(conversationId, { type: "recording_complete", ...recording });
     }
-    return conversationId;
   }
 
   /** Every recording still waiting for a conversation to claim it. */

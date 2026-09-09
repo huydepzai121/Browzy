@@ -37,6 +37,183 @@ const MCP_TAB_GROUP_TITLE = "MCP Browzy";
 const LEGACY_TAB_GROUP_TITLES = [MCP_TAB_GROUP_TITLE, "MCP"];
 let tabGroupTabs = new Set();
 
+// --- Per-tab side panel + numbered solo agent groups ----------------------
+// Panel visibility follows the EXPLICITLY opened tab only (close-on-switch):
+// the panel is visible solely on tabs where the operator clicked the toolbar
+// icon. Switching to any other tab — a fresh New Tab, a plain page, anything
+// never clicked — hides the panel the moment that tab becomes active. Chrome
+// offers no "close the side panel" call; per-tab setOptions({enabled:false})
+// on the newly active tab is the mechanism. Returning to an explicitly opened
+// tab re-enables it with no new click needed.
+//
+// Each explicitly opened tab gets its OWN numbered agent group ("Browzy",
+// "Browzy 2", "Browzy 3", ...) containing only that tab — groups are never
+// merged, and stale groups are never auto-deleted. The shared primary group
+// (tabGroupId, used by the MCP tool paths) is untouched by all of this.
+//
+// The explicit set lives in chrome.storage.session so a service-worker
+// restart does not silently close the working tab; it is best-effort with a
+// memory-only fallback and is pruned when tabs close.
+const extraAgentGroupIds = new Set();
+
+/**
+ * 1 for "Browzy", N for "Browzy N", 0 for anything else. The numbered suffix
+ * is derived from AGENT_TAB_GROUP_TITLE rather than hardcoded, so a rename
+ * keeps the whole family consistent.
+ */
+function agentFamilyTitleNumber(title) {
+  if (title === AGENT_TAB_GROUP_TITLE) return 1;
+  if (typeof title !== "string") return 0;
+  const m = /^(.*) (\d+)$/.exec(title);
+  if (m && m[1] === AGENT_TAB_GROUP_TITLE) {
+    const n = parseInt(m[2], 10);
+    return Number.isFinite(n) ? n : 0;
+  }
+  return 0;
+}
+
+function isAgentFamilyTitle(title) {
+  return agentFamilyTitleNumber(title) > 0;
+}
+
+/** Next free family title: "Browzy" when unused, otherwise "Browzy N". */
+async function nextAgentGroupTitle() {
+  let max = 0;
+  try {
+    const groups = await chrome.tabGroups.query({});
+    for (const g of groups || []) {
+      const n = agentFamilyTitleNumber(g && g.title);
+      if (n > max) max = n;
+    }
+  } catch {
+    // Group listing unavailable: fall back to the base title. Grouping still
+    // works; only the numbering may collide, which is cosmetic.
+  }
+  const next = max + 1;
+  return next <= 1 ? AGENT_TAB_GROUP_TITLE : AGENT_TAB_GROUP_TITLE + " " + next;
+}
+
+const PANEL_ENABLED_TABS_SESSION_KEY = "browzyPanelTabsV1";
+let panelEnabledTabsCache = null;
+
+async function loadPanelEnabledTabs() {
+  if (panelEnabledTabsCache !== null) return panelEnabledTabsCache;
+  panelEnabledTabsCache = new Set();
+  try {
+    const sessionStore =
+      typeof chrome !== "undefined" && chrome.storage && chrome.storage.session
+        ? chrome.storage.session
+        : null;
+    if (sessionStore && typeof sessionStore.get === "function") {
+      const got = await sessionStore.get(PANEL_ENABLED_TABS_SESSION_KEY);
+      const arr = got && got[PANEL_ENABLED_TABS_SESSION_KEY];
+      if (Array.isArray(arr)) {
+        for (const id of arr) if (typeof id === "number") panelEnabledTabsCache.add(id);
+      }
+    }
+  } catch {
+    // Memory-only fallback: the rule still holds until the next eviction.
+  }
+  return panelEnabledTabsCache;
+}
+
+async function persistPanelEnabledTabs() {
+  if (panelEnabledTabsCache === null) return;
+  try {
+    const sessionStore =
+      typeof chrome !== "undefined" && chrome.storage && chrome.storage.session
+        ? chrome.storage.session
+        : null;
+    if (sessionStore && typeof sessionStore.set === "function") {
+      await sessionStore.set({ [PANEL_ENABLED_TABS_SESSION_KEY]: [...panelEnabledTabsCache] });
+    }
+  } catch {
+    // Best-effort: visibility still enforced from memory for this lifetime.
+  }
+}
+
+async function isPanelTabExplicitlyEnabled(tabId) {
+  if (typeof tabId !== "number") return false;
+  return (await loadPanelEnabledTabs()).has(tabId);
+}
+
+/** Remember an explicit toolbar-icon open. Fire-and-forget (never awaited on the gesture path). */
+function markPanelTabEnabled(tabId) {
+  return loadPanelEnabledTabs().then((set) => {
+    set.add(tabId);
+    return persistPanelEnabledTabs();
+  });
+}
+
+/** Forget a closed tab so the set cannot grow unbounded. Fire-and-forget. */
+function forgetPanelTab(tabId) {
+  if (panelEnabledTabsCache === null) return Promise.resolve(false);
+  if (!panelEnabledTabsCache.delete(tabId)) return Promise.resolve(false);
+  return persistPanelEnabledTabs().then(() => true);
+}
+
+/** Synchronous group-membership check against every group id we track. */
+function isOwnAgentGroupId(groupId) {
+  if (typeof groupId !== "number" || groupId === -1) return false;
+  if (groupId === tabGroupId) return true;
+  if (typeof extraAgentGroupIds !== "undefined" && extraAgentGroupIds.has(groupId)) return true;
+  return false;
+}
+
+// Serializes solo-group creation so rapid icon clicks number groups
+// sequentially instead of racing two creations onto the same title.
+let soloGroupChain = Promise.resolve();
+
+function adoptSoloAgentGroup(tabId) {
+  const run = soloGroupChain.then(() => adoptSoloAgentGroupInner(tabId));
+  soloGroupChain = run.catch(() => {});
+  return run;
+}
+
+/**
+ * Give an explicitly clicked tab its own numbered solo group, recording the
+ * previous group for later restore (same borrowed-tab contract as
+ * adoptBorrowedTab). Never merges into the shared group; a re-click on a tab
+ * already in one of our own family groups keeps it where it is.
+ */
+async function adoptSoloAgentGroupInner(tabId) {
+  if (typeof tabId !== "number" || adoptedBorrowedTabs.has(tabId)) return false;
+  let tab;
+  try {
+    tab = await chrome.tabs.get(tabId);
+  } catch {
+    return false; // Tab vanished before it could be grouped.
+  }
+  if (typeof tab.groupId === "number" && tab.groupId !== -1) {
+    let own = isOwnAgentGroupId(tab.groupId);
+    if (!own) {
+      try {
+        const g = await chrome.tabGroups.get(tab.groupId);
+        const title = g && g.title;
+        own = isAgentFamilyTitle(title) || LEGACY_TAB_GROUP_TITLES.includes(title);
+      } catch {
+        own = false;
+      }
+    }
+    if (own) {
+      extraAgentGroupIds.add(tab.groupId);
+      return false; // Already ours — kept, not regrouped.
+    }
+  }
+  adoptedBorrowedTabs.set(tabId, tab.groupId ?? -1);
+  const title = await nextAgentGroupTitle();
+  // Claimed in adoptedBorrowedTabs BEFORE the grouping call (same reason
+  // ensureTabGroup claims first): the grouping event must not look operator-made.
+  const groupId = await chrome.tabs.group({ tabIds: [tabId] });
+  try {
+    await chrome.tabGroups.update(groupId, { title: title, color: "blue" });
+  } catch {
+    // Cosmetic only — the tab is still isolated in its own group.
+  }
+  extraAgentGroupIds.add(groupId);
+  return true;
+}
+
 // Epoch ms of the most recent moment a tool dispatch held the browser. Chrome
 // puts a tab opened FROM a grouped tab (target=_blank, window.open, a
 // ctrl-clicked link) into that same group automatically, and the tab strip
@@ -1496,6 +1673,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
     tabs.delete(tabId);
     if (tabs.size === 0) overlayRunTabs.delete(runId);
   }
+  // A closed tab must not linger in the panel's explicit-open set either.
+  if (typeof forgetPanelTab === "function") forgetPanelTab(tabId).catch(() => {});
 });
 
 /** Send a stop instruction to the native host over the EXACT SAME wire path
@@ -1913,7 +2092,29 @@ async function isInGroup(tabId) {
       // with a fixed dependency list, where a bare reference would be a
       // ReferenceError rather than a no-op.
       if (typeof adoptedBorrowedTabs !== "undefined" && adoptedBorrowedTabs.has(tabId)) return false;
-      return tab.groupId === tabGroupId;
+      if (tab.groupId === tabGroupId) return true;
+      if (typeof extraAgentGroupIds !== "undefined" && extraAgentGroupIds.has(tab.groupId)) return true;
+      // A solo group created while the worker was evicted is untracked in
+      // memory: recognize the family by live title (the same rule recovery
+      // uses) rather than refusing a tab that is legitimately ours. The
+      // typeof guards keep this body compilable standalone in the test
+      // sandboxes, which do not declare these names.
+      try {
+        if (chrome.tabGroups && typeof chrome.tabGroups.get === "function") {
+          const liveGroup = await chrome.tabGroups.get(tab.groupId);
+          const liveTitle = liveGroup && liveGroup.title;
+          const family =
+            (typeof isAgentFamilyTitle === "function" && isAgentFamilyTitle(liveTitle)) ||
+            (typeof LEGACY_TAB_GROUP_TITLES !== "undefined" && LEGACY_TAB_GROUP_TITLES.includes(liveTitle));
+          if (family) {
+            if (typeof extraAgentGroupIds !== "undefined") extraAgentGroupIds.add(tab.groupId);
+            return true;
+          }
+        }
+      } catch {
+        // Unknown group: not ours.
+      }
+      return false;
     }
     return tabGroupTabs.has(tabId);
   } catch {
@@ -5824,29 +6025,25 @@ if (hasSidePanel) {
   // Handling the click ourselves keeps the icon the one control that always
   // works: it re-enables this tab and opens the panel, from anywhere.
   chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: false }).catch(() => {});
+  console.log("[browzy-panel] per-tab close-on-switch rule active (v2)");
 
-  // Close the panel on tabs outside the agent's own tab group, and bring it
-  // back inside. Chrome has no "close the side panel" call; per-tab `enabled`
-  // is the mechanism, and Chrome applies it the moment such a tab is active.
+  // Close the panel on every tab the operator did NOT explicitly open it on,
+  // and keep it on the ones they did. Chrome has no "close the side panel"
+  // call; per-tab `enabled` is the mechanism, and Chrome applies it the
+  // moment such a tab is active — so switching to a fresh New Tab, or to any
+  // plain tab mid-work, hides the panel immediately, and switching back to
+  // an explicitly opened tab brings it back with no new click.
   //
-  // Group membership is the ONLY rule here. An earlier version also carried a
-  // per-tab exemption for "the operator clicked the icon here", which was a
-  // mistake worth recording: clicking the icon is how the panel is normally
-  // opened, so the exemption applied to essentially every tab and the panel
-  // never closed anywhere. The icon now adopts its tab into the group instead
-  // (see action.onClicked), which reaches the same goal through the one
-  // concept rather than a second one competing with it.
+  // Group membership is deliberately NOT the rule anymore: each working tab
+  // owns its own numbered solo group, so "inside a group" would keep the
+  // panel open almost everywhere. The explicit set lives in
+  // chrome.storage.session (see markPanelTabEnabled) so a service-worker
+  // restart does not silently close the working tab. The blank-tab exception
+  // below keeps a New Tab hidden even if it somehow got marked, unless it is
+  // the explicitly opened tab already sitting in one of our own groups.
   //
-  // The remaining escape is deliberate: with no agent group yet
-  // (tabGroupId === null) every tab keeps the panel. The panel is where a run
-  // is STARTED, so a rule that hid it before any group existed would make the
-  // extension unopenable.
-  // `tabGroupId` is service-worker memory, and MV3 evicts the worker
-  // constantly — every eviction resets it to null. Reading it directly made
-  // this rule conclude "there is no agent group" almost always, so the panel
-  // stayed enabled on every tab and never closed anywhere. isInGroup() already
-  // faces the same problem and already recovers by title (see its own
-  // "Always check live state" note); this is that recovery, reusable.
+  // resolveAgentGroupId() below is kept for the group-recovery paths that
+  // still need it; the visibility rule itself no longer reads group state.
   async function resolveAgentGroupId() {
     if (tabGroupId !== null) return tabGroupId;
     if (!chrome.tabGroups || typeof chrome.tabGroups.query !== "function") return null;
@@ -5867,23 +6064,40 @@ if (hasSidePanel) {
 
   async function syncSidePanelForTab(tabId) {
     if (typeof chrome.sidePanel.setOptions !== "function") return;
-    let enabled = true;
-    const agentGroupId = await resolveAgentGroupId();
-    if (agentGroupId !== null) {
-      try {
-        const tab = await chrome.tabs.get(tabId);
-        enabled = tab.groupId === agentGroupId;
-      } catch {
-        // Tab vanished mid-check; nothing to configure.
-        return;
+    const explicit = await isPanelTabExplicitlyEnabled(tabId);
+    let enabled = explicit;
+    let why = explicit ? "explicitly-opened" : "never-opened-here";
+    let windowId = null;
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      windowId = tab.windowId != null ? tab.windowId : null;
+      if (enabled && isBlankNewTab(tab) && !isOwnAgentGroupId(tab.groupId)) {
+        enabled = false;
+        why = "blank-and-ungrouped";
       }
+    } catch {
+      // Tab vanished mid-check; nothing to configure.
+      return;
     }
-    dbg("panel", `side panel ${enabled ? "enabled" : "disabled"} for tab ${tabId}`, { group: agentGroupId });
+    console.log("[browzy-panel] tab " + tabId + " -> " + (enabled ? "ENABLED" : "disabled") + " (" + why + ")");
+    dbg("panel", `side panel ${enabled ? "enabled" : "disabled"} for tab ${tabId}`, { explicit: enabled });
     // `path` only when enabling: a tab-scoped entry does not inherit the
     // manifest's default_path, so an enabled entry without one shows nothing.
     // Disabling must NOT carry a path — there is nothing to point at.
     const options = enabled ? { tabId, path: SIDE_PANEL_PATH, enabled: true } : { tabId, enabled: false };
     chrome.sidePanel.setOptions(options).catch(() => {});
+    if (!enabled && typeof chrome.sidePanel.close === "function") {
+      // Chrome 141+: close the tab's panel deterministically, then shut a
+      // lingering GLOBAL panel instance window-wide (per-tab disable and
+      // per-tab close do not reach it). Tabs holding an active tab-specific
+      // panel keep theirs. Rejections (no panel open) are normal — silent.
+      // Older browsers (manifest minimum is 116) skip via the typeof guard.
+      // Not awaited: nothing after either call depends on the result.
+      chrome.sidePanel.close({ tabId }).catch(() => {});
+      if (windowId !== null) {
+        chrome.sidePanel.close({ windowId }).catch(() => {});
+      }
+    }
   }
 
   chrome.tabs.onActivated.addListener(({ tabId }) => {
@@ -5910,11 +6124,14 @@ if (hasSidePanel) {
     }
   })();
 
-  // The agent's group going away must not leave tabs disabled: re-evaluate the
-  // active tab, which now resolves to "no group" and re-enables the panel.
+  // A removed group must not leave its tabs in a stale state: forget the id
+  // and re-evaluate the active tab against the explicit-open set.
   if (chrome.tabGroups && chrome.tabGroups.onRemoved) {
     chrome.tabGroups.onRemoved.addListener((group) => {
       if (group && group.id === tabGroupId) tabGroupId = null;
+      // Solo groups are tracked separately and simply forgotten — never
+      // re-created, never merged; stale groups are left alone by design.
+      if (group && typeof extraAgentGroupIds !== "undefined") extraAgentGroupIds.delete(group.id);
       chrome.tabs
         .query({ active: true, lastFocusedWindow: true })
         .then(([active]) => {
@@ -5976,12 +6193,16 @@ chrome.action.onClicked.addListener((tab) => {
       } else {
         chrome.sidePanel.open({ windowId: tab.windowId }).catch(() => {});
       }
-      // Then put this tab in the group, which is what actually keeps the panel
-      // open here: the group is the single rule syncSidePanelForTab() reads.
-      // Clicking the icon is the operator naming the tab they want to work on,
-      // so it adopts even a blank New Tab — the passive page-context path
-      // still will not.
-      if (tab.id != null) adoptBorrowedTab(tab.id, { explicit: true }).catch(() => {});
+      // Then remember this tab as explicitly opened (persisted, so a worker
+      // restart keeps it) and give it its own numbered solo group — never
+      // merged into the shared group. Clicking the icon is the operator
+      // naming the tab they want to work on, so it enables even a blank New
+      // Tab; the passive page-context path still will not. Neither call is
+      // awaited: the gesture above is already spent on open().
+      if (tab.id != null) {
+        markPanelTabEnabled(tab.id).catch(() => {});
+        adoptSoloAgentGroup(tab.id).catch(() => {});
+      }
     }
     return;
   }
@@ -6000,18 +6221,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   }
   if (!msg) return;
   if (msg.type === "panel_bind_tab") {
-    // The sidepanel bound (or re-bound) its page context. Adopt the new tab
-    // into the visible group and release the previous one, so the group
-    // always shows exactly the page the assistant is currently looking at —
-    // and so merely opening the panel is enough, with no message sent.
-    (async () => {
-      if (typeof msg.previousTabId === "number" && msg.previousTabId !== msg.tabId) {
-        await releaseBorrowedTab(msg.previousTabId);
-      }
-      const adopted = msg.tabId === null || msg.tabId === undefined ? false : await adoptBorrowedTab(msg.tabId);
-      sendResponse({ ok: true, adopted });
-    })();
-    return true; // async sendResponse
+    // Page-context binding only selects what the panel READS — it must never
+    // move tabs between groups. Each working tab owns its numbered solo group
+    // from an explicit toolbar-icon click, and releasing the previously bound
+    // tab on every switch would dismantle those groups as the operator
+    // browses. Grouping changes come solely from explicit icon clicks
+    // (adoptSoloAgentGroup) and agent-created tabs.
+    sendResponse({ ok: true, adopted: false });
+    return; // sync response
   }
   if (msg.type === "agent_settings") {
     // extension/settings/settings-client.js's documented contract — see
@@ -6319,7 +6536,29 @@ async function guardInheritedTabGroup(tab) {
       return "ignored";
     }
   }
-  if (tabGroupId === null || tab.groupId !== tabGroupId) return "ignored";
+  // Family-aware membership: the primary group plus every numbered solo group
+  // ("Browzy 2", ...) an explicit icon click created. The typeof guards keep
+  // this body compilable standalone in the test sandboxes.
+  const inPrimary = tabGroupId !== null && tab.groupId === tabGroupId;
+  const inSolo = typeof extraAgentGroupIds !== "undefined" && extraAgentGroupIds.has(tab.groupId);
+  if (!inPrimary && !inSolo) {
+    // Untracked group (e.g. created while the worker was evicted): check the
+    // live title before treating it as somebody else's.
+    let family = false;
+    try {
+      if (typeof chrome !== "undefined" && chrome.tabGroups && typeof chrome.tabGroups.get === "function") {
+        const liveGroup = await chrome.tabGroups.get(tab.groupId);
+        const liveTitle = liveGroup && liveGroup.title;
+        family =
+          (typeof isAgentFamilyTitle === "function" && isAgentFamilyTitle(liveTitle)) ||
+          (typeof LEGACY_TAB_GROUP_TITLES !== "undefined" && LEGACY_TAB_GROUP_TITLES.includes(liveTitle));
+      }
+    } catch {
+      family = false;
+    }
+    if (!family) return "ignored";
+    if (typeof extraAgentGroupIds !== "undefined") extraAgentGroupIds.add(tab.groupId);
+  }
 
   // `typeof` rather than a bare read: this guard is extracted and compiled
   // standalone by test/tab-group-inheritance.test.mjs, where an undeclared name
@@ -6410,6 +6649,19 @@ async function recoverTabGroupState() {
       tabGroupId = groups[0].id;
       const tabs = await chrome.tabs.query({ groupId: tabGroupId });
       tabGroupTabs = new Set(tabs.map((t) => t.id));
+    }
+    // Numbered solo groups ("Browzy 2", ...) from earlier sessions: track
+    // them, never merge them into the primary group.
+    try {
+      const all = await chrome.tabGroups.query({});
+      for (const g of all || []) {
+        if (!g || g.id === tabGroupId) continue;
+        if (typeof isAgentFamilyTitle === "function" ? isAgentFamilyTitle(g.title) : g.title === AGENT_TAB_GROUP_TITLE) {
+          extraAgentGroupIds.add(g.id);
+        }
+      }
+    } catch {
+      // Tracking is best-effort; the live-title checks recover stragglers.
     }
   } catch {
     // Not critical — will be set on first tabs_context_mcp call
