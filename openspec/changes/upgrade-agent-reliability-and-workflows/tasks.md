@@ -11,7 +11,7 @@ All tasks are intentionally unchecked. This change is specification-only. Scope 
 
 ## 1. P0 Minimum Document Identity Prerequisite
 
-- [ ] 1.1 Verify the strongest feasible browser/content-script document identity using tab/frame identity, committed navigation signal, lifecycle state, and a per-document nonce across same-URL reload, SPA route changes, close, browser restart, and frames.
+- [x] 1.1 Verify the strongest feasible browser/content-script document identity using tab/frame identity, committed navigation signal, lifecycle state, and a per-document nonce across same-URL reload, SPA route changes, close, browser restart, and frames.
 - [ ] 1.2 Define the minimum document binding and execution nonce required by send, lease acquisition, read, mutation, and approval validation; keep persistent workflow domain/scope constraints separate from per-execution nonces.
 - [ ] 1.3 Define correlated navigation semantics: an authorized create/navigate action may commit an in-scope destination after destination domain/scope validation; unexpected replacement invalidates old refs, permissions, and approvals.
 - [ ] 1.4 Add unit/integration tests for token creation, same-URL reload, SPA navigation, tab close, stale nonce, authorized navigation commit, unexpected replacement, and destination rejection. <- (verify: no URL-only fallback remains for a boundary that cannot establish identity)
