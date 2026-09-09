@@ -90,9 +90,24 @@ function buildCore({ sdk, profileProvider } = {}) {
   const lease = new BrowserLease();
   const approvals = new ApprovalRegistry();
   const sessionManager = new SessionManager({ store, lease, approvals });
+  // toolCalls: every name this run's ToolBridge was actually asked to
+  // dispatch. Every failure-path test in this file asserts this stays
+  // empty — direct, empirical proof that THIS LAYER's own failure handling
+  // (companion.js's catch blocks, the compatibility gate, the profile-
+  // resolution failure path) contains no code that calls the tool bridge
+  // itself to replay a browser action. Scope note: this does NOT prove the
+  // SDK itself never replays a tool call on resume — that is gate-0.2's G1
+  // (in-process tool-handler invocation-count delta of 0 across a resumed
+  // turn) plus the still-open "live browser tool call replay end to end"
+  // gap neither gate has closed (no live Chrome/extension attached). The
+  // two claims are complementary, not the same proof.
+  const toolCalls = [];
   const toolBridge = new ToolBridge({
     init: async () => {},
-    callTool: async (name) => ({ content: [{ type: "text", text: `fake:${name}` }] }),
+    callTool: async (name) => {
+      toolCalls.push(name);
+      return { content: [{ type: "text", text: `fake:${name}` }] };
+    },
     shutdown: () => {}
   });
   const core = new CompanionCore({
@@ -103,7 +118,7 @@ function buildCore({ sdk, profileProvider } = {}) {
     sdk: sdk || scriptedSdk([{ messages: [{ type: "assistant", text: "ok" }] }]),
     profileProvider: profileProvider || fakeProfileProvider()
   });
-  return { core, sessionManager, store, lease, approvals };
+  return { core, sessionManager, store, lease, approvals, toolCalls };
 }
 
 async function waitUntil(fn, { timeoutMs = 3000, intervalMs = 15 } = {}) {
@@ -230,7 +245,7 @@ await (async function firstTurnCapturesAndSecondTurnResumes() {
 await (async function incompatibleModelIsRejectedWithStructuredMismatches() {
   freshHome();
   const sdk = scriptedSdk([{ initSessionId: "sdk-sess-1", messages: [{ type: "assistant", text: "first" }] }]);
-  const { core, sessionManager } = buildCore({ sdk });
+  const { core, sessionManager, toolCalls } = buildCore({ sdk });
   await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.HELLO, {}));
   const { conversationId } = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.NEW, {}));
   await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.START, { conversationId, profileId: "p1", modelId: "m1", prompt: "a" }));
@@ -244,6 +259,7 @@ await (async function incompatibleModelIsRejectedWithStructuredMismatches() {
   ok(Boolean(rejection), "a structured run_error with reason conversation_identity_incompatible is emitted");
   ok(Array.isArray(rejection.mismatches) && rejection.mismatches.some((m) => m.field === "modelId"), "the mismatch payload names the exact field that disagreed");
   ok(snap.events.some((e) => e.type === "run_stopped" && e.reason === "conversation_identity_incompatible"), "the run is stopped explicitly (lease released), never left dangling");
+  ok(toolCalls.length === 0, "rejecting an incompatible-selection turn dispatches zero browser tool calls (no mutation replay)");
 })();
 
 await (async function newSdkSessionExplicitlyBypassesRejectionAndResume() {
@@ -289,7 +305,7 @@ await (async function missingSessionIsClassifiedAndNeverAutoRetried() {
     { throwError: missingErr }, // turn 2 attempts resume of sdk-sess-1 and fails
     { initSessionId: "sdk-sess-3-fresh", messages: [{ type: "assistant", text: "third, fresh" }] } // turn 3 must NOT retry resume
   ]);
-  const { core, sessionManager } = buildCore({ sdk });
+  const { core, sessionManager, toolCalls } = buildCore({ sdk });
   await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.HELLO, {}));
   const { conversationId } = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.NEW, {}));
 
@@ -312,6 +328,7 @@ await (async function missingSessionIsClassifiedAndNeverAutoRetried() {
   ok(sdk.calls[2].options.resume === undefined, "the very next turn does not automatically retry the failed resume");
   ok(sdk.calls[2].prompt === "c", "the fresh turn's prompt is exactly its own text, no reconstruction from the missing session's prior turns");
   ok(sessionManager.getConversationMetadata(conversationId).sdkSessionRef.sessionId === "sdk-sess-3-fresh", "the fresh session captured on recovery replaces the known-stale ref (not a conflict, since the old one was MISSING)");
+  ok(toolCalls.length === 0, "the missing-session failure and its recovery turn dispatch zero browser tool calls (no mutation replay)");
 })();
 
 await (async function abortedPartialTurnStillPreservesTheCapturedRefForTheNextTurn() {
@@ -325,7 +342,7 @@ await (async function abortedPartialTurnStillPreservesTheCapturedRefForTheNextTu
     { initSessionId: "sdk-sess-partial", throwError: new Error("stream interrupted") },
     { initSessionId: "sdk-sess-partial", messages: [{ type: "assistant", text: "continued" }] }
   ]);
-  const { core, sessionManager } = buildCore({ sdk });
+  const { core, sessionManager, toolCalls } = buildCore({ sdk });
   await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.HELLO, {}));
   const { conversationId } = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.NEW, {}));
 
@@ -340,6 +357,8 @@ await (async function abortedPartialTurnStillPreservesTheCapturedRefForTheNextTu
   await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.START, { conversationId, profileId: "p1", modelId: "m1", prompt: "b" }));
   await waitUntil(() => sdk.calls.length === 2);
   ok(sdk.calls[1].options.resume === "sdk-sess-partial", "the next turn successfully resumes using the ref preserved across the partial turn");
+  ok(sdk.calls[1].prompt === "b", "the turn following a partial failure sends only its own text");
+  ok(toolCalls.length === 0, "a partial-turn failure and its follow-up dispatch zero browser tool calls (no mutation replay)");
 })();
 
 await (async function deliberateStopIsNeverReclassifiedAsAResumeFailure() {
@@ -353,7 +372,7 @@ await (async function deliberateStopIsNeverReclassifiedAsAResumeFailure() {
       yield { type: "assistant", text: "slow" };
     }
   };
-  const { core, sessionManager } = buildCore({ sdk });
+  const { core, sessionManager, toolCalls } = buildCore({ sdk });
   await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.HELLO, {}));
   const { conversationId } = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.NEW, {}));
   await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.START, { conversationId, profileId: "p1", modelId: "m1", prompt: "a" }));
@@ -365,6 +384,7 @@ await (async function deliberateStopIsNeverReclassifiedAsAResumeFailure() {
   ok(snap.events.some((e) => e.type === "run_stopped"), "a deliberate stop emits run_stopped");
   ok(!snap.events.some((e) => e.type === "run_error" && (e.reason === "session_missing" || e.reason === "session_resume_failed")), "a deliberate stop is never reclassified as a resume/session failure");
   ok(sessionManager.getConversationMetadata(conversationId).sdkSessionRef?.status === SDK_SESSION_REF_STATUS.ACTIVE, "the ref captured before the stop stays ACTIVE — a user stop does not poison it");
+  ok(toolCalls.length === 0, "a cancellation (stop) dispatches zero browser tool calls (no mutation replay)");
 })();
 
 console.log("\n2.3/2.5 — companion restart survives via durable sdkSessionRef, deletion tombstone + late-unwind sweep\n");
@@ -434,7 +454,7 @@ await (async function deletionTombstoneOrderingPreventsLateResurrectionDuringAnA
       yield { type: "assistant", text: "slow" };
     }
   };
-  const { core, sessionManager } = buildCore({ sdk });
+  const { core, sessionManager, toolCalls } = buildCore({ sdk });
   await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.HELLO, {}));
   const { conversationId } = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.NEW, {}));
   await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.START, { conversationId, profileId: "p1", modelId: "m1", prompt: "a" }));
@@ -449,6 +469,111 @@ await (async function deletionTombstoneOrderingPreventsLateResurrectionDuringAnA
   await new Promise((r) => setTimeout(r, 300));
   ok(sessionManager.hasConversation(conversationId) === false, "the conversation is STILL gone after the aborted run's asynchronous unwind completes — no late resurrection");
   ok(sessionManager.getConversationMetadata(conversationId) === null, "no metadata (including any sdkSessionRef) resurrects either");
+  ok(toolCalls.length === 0, "deleting an active run dispatches zero browser tool calls (no mutation replay)");
+})();
+
+console.log("\n2.6 — credential-unavailable: a resume-eligible turn whose credential is gone never attempts resume\n");
+
+await (async function credentialUnavailableNeverAttemptsResumeAndLeavesTheRefUntouched() {
+  // Task 2.4/2.6: "reject ... unavailable current credentials with explicit
+  // recovery/new-conversation UI" — this is distinct from
+  // incompatibleModelIsRejectedWithStructuredMismatches above (a mismatched
+  // endpoint/model, known before any credential lookup) and distinct from
+  // missingSessionIsClassifiedAndNeverAutoRetried (an SDK-level resume
+  // failure). Here turn 1 succeeds and captures an ACTIVE, resume-eligible
+  // ref; turn 2 requests the SAME compatible identity, but this run's own
+  // credential resolution (host/agent/companion.js's
+  // resolveProfileSnapshot(), called BEFORE assessResumeCompatibility()/
+  // getResumeSessionId() in _runAfterLeaseGranted) fails — proving the SDK
+  // is never even reached, so no resume is attempted, and the captured ref
+  // is left completely untouched (not marked MISSING/RESUME_FAILED — that
+  // classification is reserved for an actual attempted-and-failed SDK
+  // resume, never for a credential that never got far enough to try).
+  freshHome();
+  const sdk = scriptedSdk([{ initSessionId: "sdk-sess-cred", messages: [{ type: "assistant", text: "first" }] }]);
+  let profileCalls = 0;
+  const profileProvider = {
+    async snapshotForRun(profileId, modelId) {
+      profileCalls++;
+      if (profileCalls === 2) {
+        throw new Error("credential revoked"); // resolveProfileSnapshot() wraps this into ProfileUnavailableError
+      }
+      return {
+        model: modelId || "claude-fake-model",
+        env: { ANTHROPIC_BASE_URL: "https://example.invalid", ANTHROPIC_API_KEY: "super-secret-fake-key" },
+        revision: 1,
+        credentialRevision: 1,
+        profileId: profileId || "default"
+      };
+    }
+  };
+  const { core, sessionManager, toolCalls } = buildCore({ sdk, profileProvider });
+  await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.HELLO, {}));
+  const { conversationId } = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.NEW, {}));
+
+  await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.START, { conversationId, profileId: "p1", modelId: "m1", prompt: "a" }));
+  await waitUntil(() => sdk.calls.length === 1);
+  const refBefore = sessionManager.getConversationMetadata(conversationId).sdkSessionRef;
+  ok(refBefore.sessionId === "sdk-sess-cred" && refBefore.status === SDK_SESSION_REF_STATUS.ACTIVE, "turn 1 captured an ACTIVE, resume-eligible ref");
+
+  await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.START, { conversationId, profileId: "p1", modelId: "m1", prompt: "what did I say?" }));
+  await waitUntil(() => profileCalls === 2);
+  await new Promise((r) => setTimeout(r, 200));
+
+  ok(sdk.calls.length === 1, "a credential-unavailable turn never reaches sdk.query() — no resume is attempted");
+  const snap = sessionManager.snapshotSince(conversationId, 0);
+  ok(snap.events.some((e) => e.type === "run_error" && e.reason === "profile_unavailable"), "the failure surfaces as an explicit profile_unavailable run_error");
+  ok(snap.events.some((e) => e.type === "run_stopped" && e.reason === "profile_unavailable"), "the run is stopped explicitly with the same reason (lease released), symmetric with the incompatible-selection rejection above");
+  const refAfter = sessionManager.getConversationMetadata(conversationId).sdkSessionRef;
+  ok(refAfter.status === SDK_SESSION_REF_STATUS.ACTIVE, "the ref's status is left ACTIVE — credential unavailability is never misclassified as a resume failure");
+  ok(refAfter.sessionId === "sdk-sess-cred", "the captured sessionId is untouched");
+  ok(toolCalls.length === 0, "a credential-unavailable turn dispatches zero browser tool calls (no mutation replay)");
+})();
+
+console.log("\n2.6 — race: DELETE_CONVERSATION arrives while a turn is mid-flight, strictly before its init/session_id message\n");
+
+await (async function deleteRacesAheadOfAnInFlightSessionIdCapture() {
+  // The precise race companion.js's own _runQuery comment names ("this
+  // conversation was deleted the instant this message arrived") and
+  // session/manager.js's claimSdkSessionRef()/markSdkSessionRefStatus()
+  // guard against (both check the tombstone set FIRST, before writing any
+  // metadata). deletionTombstoneOrderingPreventsLateResurrectionDuringAnActiveRun
+  // above proves general no-resurrection for a run that never captures a
+  // session_id at all; this test is the one that actually exercises a
+  // session_id/init message arriving from the SDK strictly AFTER the
+  // tombstone is already set, proving claimSdkSessionRef's own guard
+  // end-to-end rather than only by source inspection.
+  freshHome();
+  let releaseInit;
+  const gate = new Promise((resolve) => { releaseInit = resolve; });
+  const sdk = {
+    calls: [],
+    async *query({ prompt, options }) {
+      sdk.calls.push({ prompt, options });
+      await gate; // held open by the test until AFTER delete has run
+      yield { type: "system", subtype: "init", session_id: "sdk-sess-late-race", slash_commands: [] };
+      yield { type: "assistant", text: "too late" };
+    }
+  };
+  const { core, sessionManager, toolCalls } = buildCore({ sdk });
+  await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.HELLO, {}));
+  const { conversationId } = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.NEW, {}));
+  const startReply = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.START, { conversationId, profileId: "p1", modelId: "m1", prompt: "a" }));
+  ok(startReply.accepted, "the run actually started (uncontested lease) before the race begins");
+  await waitUntil(() => sdk.calls.length === 1);
+
+  const del = await core.handleEnvelope(makeEnvelope(AGENT_MESSAGE_TYPES.DELETE_CONVERSATION, { conversationId }));
+  ok(del.deleted === true, "delete succeeds while the query is mid-flight, strictly before any init/session_id was ever yielded");
+  ok(sessionManager.hasConversation(conversationId) === false, "the conversation is gone immediately, before the SDK has said anything");
+
+  // Now let the in-flight query's init message (carrying a session_id)
+  // arrive — deliberately AFTER the tombstone was already set.
+  releaseInit();
+  await new Promise((r) => setTimeout(r, 200));
+
+  ok(sessionManager.hasConversation(conversationId) === false, "still gone — a session_id captured strictly after deletion did not resurrect the conversation");
+  ok(sessionManager.getConversationMetadata(conversationId) === null, "no sdkSessionRef (or any other metadata) was written by the late-arriving claim racing the tombstone");
+  ok(toolCalls.length === 0, "the raced-out turn dispatches zero browser tool calls (no mutation replay)");
 })();
 
 console.log(`\n${fail === 0 ? "ALL SESSION CONTINUITY TESTS PASSED" : `${fail} FAILURE(S)`}\n`);
