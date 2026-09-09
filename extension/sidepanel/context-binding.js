@@ -82,15 +82,25 @@ export function referencesCurrentPage(text) {
  *   only to decide `mustRead` — never mutated, never included in the
  *   returned object.
  * @param {object|null} params.context - a PageContextTracker snapshot
- *   ({tabId, url, title, hostname, favIconUrl, pinned, restricted, revision}),
- *   or null when no page context is bound (removed / never established).
+ *   ({tabId, url, title, hostname, favIconUrl, pinned, restricted, revision,
+ *   doc}), or null when no page context is bound (removed / never established).
  * @param {number} [params.boundAt] - capture time (ms epoch); defaults to now.
  * @returns {{tabId:number, url:string|null, title:string|null,
  *   hostname:string|null, revision:number, boundAt:number,
- *   restricted:boolean, pinned:boolean, mustRead:boolean}|null}
+ *   restricted:boolean, pinned:boolean, mustRead:boolean,
+ *   docGeneration:number|null, docConfirmed:boolean, docNonce:string|null}|null}
+ *
+ * Tasks.md 7.1/7.2: the minimum document identity rides along (`doc*`
+ * fields, straight from the snapshot's own `doc` block). `docNonce` is
+ * panel-observed evidence for the host's approval binding — never invented
+ * here (null unless the snapshot's doc channel confirmed it). A null
+ * `docGeneration` means the doc channel was unavailable for this send: the
+ * host must apply its own fail-closed read/mutation guards rather than treat
+ * tabId+url as confirmed identity.
  */
 export function buildContextMetadata({ text, context, boundAt } = {}) {
   if (!context || context.tabId == null) return null;
+  const doc = context.doc && typeof context.doc === "object" ? context.doc : null;
   return {
     tabId: context.tabId,
     url: context.url || null,
@@ -100,6 +110,12 @@ export function buildContextMetadata({ text, context, boundAt } = {}) {
     boundAt: boundAt ?? Date.now(),
     restricted: !!context.restricted,
     pinned: !!context.pinned,
-    mustRead: referencesCurrentPage(text)
+    mustRead: referencesCurrentPage(text),
+    // Minimum document identity (tasks.md 7.1/7.2) — see the docstring above
+    // for the null/confirmed contract. Captured content keeps THESE values
+    // as its original source identity even after later refreshes.
+    docGeneration: doc && doc.generation !== undefined ? doc.generation : null,
+    docConfirmed: doc ? doc.confirmed === true : false,
+    docNonce: doc && doc.confirmed === true && doc.docNonce ? doc.docNonce : null
   };
 }

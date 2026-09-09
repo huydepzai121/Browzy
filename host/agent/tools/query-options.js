@@ -531,6 +531,21 @@ export async function resolveProfileSnapshot({ profileId, modelId, profileProvid
  *   scope is resume/reject/recover, not an explicit-branch UI; decision 1
  *   reserves `forkSession` for "a deliberate branch ... an explicit
  *   new-conversation action", which is out of this task's scope.
+ * @param {number|null} [params.maxTurns] - tasks.md 5.2: forwarded as the
+ *   SDK's own `maxTurns` option. Honest semantics, per gate-0.2 evidence G6:
+ *   this caps the SDK's internal multi-round TOOL loop within one top-level
+ *   turn (reported as `error_max_turns`), NOT paced streaming-input
+ *   conversation turns — the identical paced harness that triggers
+ *   `error_max_budget_usd` sailed past `maxTurns: 2` untouched. The local
+ *   wall-clock/model-turn admission counter (conversationMetadata.
+ *   budgetPolicy) stays authoritative regardless; this is best-effort on top.
+ * @param {number|null} [params.maxBudgetUsd] - tasks.md 5.2: forwarded as
+ *   the SDK's own `maxBudgetUsd` option. This is the SDK's ESTIMATED
+ *   query-budget stop, never a hard provider billing ceiling (gate-0.2
+ *   evidence G7: the stop lands AFTER the turn that crosses the cap — a real
+ *   in-flight overrun of several multiples was observed — and the figure is
+ *   a cost-table estimate per `costBasis`, not a billing statement). The
+ *   panel MUST label it as such; see extension/sidepanel/usage-ledger-view.js.
  * @param {string[]} [params.browserToolNames] - the legacy names of every
  *   browser tool actually registered on `mcpServer`. Defaults to
  *   `sdkQualifiedToolNames()`'s own default (host/agent/tools/adapter.js's
@@ -556,7 +571,9 @@ export function buildIsolatedOptions({
   browserToolNames,
   extraToolNames = [],
   effort = null,
-  resume
+  resume,
+  maxTurns = null,
+  maxBudgetUsd = null
 }) {
   if (!mcpServer) throw new Error("buildIsolatedOptions requires mcpServer");
   if (!serverName) throw new Error("buildIsolatedOptions requires serverName");
@@ -596,6 +613,31 @@ export function buildIsolatedOptions({
         "directory, from buildSessionSkills()) — without it the SDK's `plugins` option resolves an undefined " +
         "path and silently fails to load every approved skill for this conversation instead of throwing"
     );
+  }
+
+  // Tasks.md 5.2: SDK estimated-budget options. Validated here (fail loudly,
+  // exactly like skills.cwd/configDir/pluginDir above) rather than passed
+  // blindly: a zero/negative/huge cap would either no-op into an unlimited
+  // run the panel showed as limited, or stop every turn immediately — both
+  // silent limit lies. Omitted (null/undefined) means "no SDK cap for this
+  // turn", byte-identical to every call before this task existed; the local
+  // admission policy (conversationMetadata.budgetPolicy) is enforced
+  // elsewhere and is unaffected either way.
+  if (maxTurns !== undefined && maxTurns !== null) {
+    if (!Number.isInteger(maxTurns) || maxTurns < 1 || maxTurns > 1000) {
+      throw new Error(
+        "buildIsolatedOptions requires maxTurns to be an integer in [1, 1000] when set — " +
+          "the SDK caps its internal tool-loop rounds, not conversation turns (gate-0.2 G6)"
+      );
+    }
+  }
+  if (maxBudgetUsd !== undefined && maxBudgetUsd !== null) {
+    if (typeof maxBudgetUsd !== "number" || !Number.isFinite(maxBudgetUsd) || maxBudgetUsd < 0.01 || maxBudgetUsd > 10000) {
+      throw new Error(
+        "buildIsolatedOptions requires maxBudgetUsd to be a finite number in [0.01, 10000] when set — " +
+          "an SDK cost-table estimate stop with in-flight overrun, never a billing ceiling (gate-0.2 G7)"
+      );
+    }
   }
 
   const env = {
@@ -775,6 +817,11 @@ export function buildIsolatedOptions({
     // task existed.
     persistSession: true,
     ...(resume ? { resume } : {}),
+    // Tasks.md 5.2, forwarded only when actually configured (see the
+    // validation above and the parameter docstrings for the exact
+    // gate-0.2-verified semantics of each).
+    ...(maxTurns !== undefined && maxTurns !== null ? { maxTurns } : {}),
+    ...(maxBudgetUsd !== undefined && maxBudgetUsd !== null ? { maxBudgetUsd } : {}),
     // Task 9.2: only set when the caller actually wired a canUseTool
     // callback (the host runs that need the send/submit-class gate do).
     // Absent → the SDK falls back to its default permission path for any

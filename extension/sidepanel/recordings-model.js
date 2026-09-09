@@ -142,3 +142,63 @@ export class RecordingsClient {
     });
   }
 }
+
+// --- Recording attachment states (tasks.md 6.1/6.4, panel half) -----------
+//
+// The durable states live host-side
+// (host/agent/storage/recording-attachments.js: selected -> attached ->
+// submitted -> included|unknown|failed). These pure descriptors render each
+// state distinctly so the composer can never imply the model SAW a recording
+// whose content path never succeeded: `selected`/`attached` are a pending
+// REFERENCE only, `submitted` is in-flight delivery, and only `included`
+// means model input. `unknown`/`failed` carry the exact reason, never a
+// silent absence.
+//
+// The targeted-attach wire (protocol.js RECORDING_ATTACH + background relay
+// + companion handler + sidepanel control wiring) is outstanding — see
+// tasks.md 6.3/6.6 residuals — so this module deliberately adds NO send
+// method for it: a client method with no background handler would fail
+// closed at runtime and read as a working path in review. The existing
+// attach() above keeps its current-lease routing contract unchanged.
+
+export const RECORDING_ATTACHMENT_UI_STATES = Object.freeze([
+  "selected",
+  "attached",
+  "submitted",
+  "included",
+  "unknown",
+  "failed"
+]);
+
+const ATTACHMENT_STATE_COPY = {
+  selected: { label: "Đã chọn", tone: "pending", detail: "Đã chọn bản ghi cho hội thoại này. Mô hình chưa thấy nội dung — mới chỉ là tham chiếu." },
+  attached: { label: "Đã gắn", tone: "pending", detail: "Bản ghi đã được xác minh và giữ chỗ. Mô hình vẫn chưa thấy nội dung." },
+  submitted: { label: "Đang gửi", tone: "pending", detail: "Nội dung đang được chuyển cho mô hình ở lượt tiếp theo. Chưa xác nhận." },
+  included: { label: "Đã đưa vào", tone: "ok", detail: "Mô hình đã nhận được nội dung bản ghi (đã biên tập/giới hạn theo mô tả)." },
+  unknown: { label: "Không rõ", tone: "unknown", detail: "Không xác nhận được mô hình có nhận nội dung hay không. Không tính là đã đọc." },
+  failed: { label: "Thất bại", tone: "error", detail: "Không thể đưa nội dung cho mô hình. Mô hình chưa thấy bản ghi này." }
+};
+
+/** Pure descriptor for one attachment state; unknown strings fail closed to `unknown`. */
+export function attachmentStateInfo(state, reason = null) {
+  const known = state && ATTACHMENT_STATE_COPY[state] ? state : "unknown";
+  const copy = ATTACHMENT_STATE_COPY[known];
+  return {
+    state: known,
+    label: copy.label,
+    tone: copy.tone,
+    detail: reason ? `${copy.detail} Lý do: ${reason}` : copy.detail
+  };
+}
+
+/**
+ * Validate an attach target before any wire is touched (tasks.md 6.3:
+ * explicit idle-conversation targeting). Pure — the background relay that
+ * will carry it is outstanding, so this validates intent, not delivery.
+ * @returns {{ok: true} | {ok: false, reason: string}}
+ */
+export function validateAttachTarget({ recordingId, conversationId } = {}) {
+  if (typeof recordingId !== "string" || !recordingId) return { ok: false, reason: "missing_recording_id" };
+  if (typeof conversationId !== "string" || !conversationId) return { ok: false, reason: "missing_conversation_id" };
+  return { ok: true };
+}

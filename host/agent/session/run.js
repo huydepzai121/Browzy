@@ -132,6 +132,11 @@ export class Run {
     if (this.state === RUN_STATES.STOPPED || this.state === RUN_STATES.DONE) return;
     this.state = RUN_STATES.STOPPED;
     this.approvals.invalidateForRun(this.runId);
+    // 3.4: outstanding pre-dispatch grants die with the run too — an Allow
+    // recorded a moment before Stop must never dispatch after it (the
+    // handler-side run-state check already rejects those, this is the
+    // belt-and-suspenders half).
+    if (this._approvalGrants) this._approvalGrants.clear();
     try {
       this.abortController.abort();
     } catch {}
@@ -182,11 +187,46 @@ export class Run {
     return [...this._unknownResults];
   }
 
-  issueApproval(action, target, ttlMs) {
-    return this.approvals.issue({ runId: this.runId, action, target, ttlMs });
+  issueApproval(action, target, opts = undefined, legacyTtlMs = undefined) {
+    // 3.3: `opts` is either the new `{ binding, ttlMs }` object or a legacy
+    // bare ttlMs number (the pre-3.3 positional form). Both keep working.
+    let binding = null;
+    let ttlMs = legacyTtlMs;
+    if (typeof opts === "number") {
+      ttlMs = opts;
+    } else if (opts && typeof opts === "object") {
+      binding = opts.binding ?? null;
+      if (opts.ttlMs !== undefined) ttlMs = opts.ttlMs;
+    }
+    return this.approvals.issue({ runId: this.runId, action, target, ttlMs, binding });
   }
 
-  consumeApproval(token, action, target) {
-    return this.approvals.consume(token, { runId: this.runId, action, target });
+  consumeApproval(token, action, target, binding = null) {
+    return this.approvals.consume(token, { runId: this.runId, action, target, binding });
+  }
+
+  // --- 3.4: pre-dispatch approval grants ----------------------------------
+  //
+  // The registry token above is consumed inside `canUseTool` at Allow time;
+  // the actual browser dispatch happens later, in the tool handler
+  // (host/agent/tools/adapter.js). Between the two, arguments, document,
+  // domain, scope, nonce, or state may have changed — "Allow cannot dispatch
+  // stale evidence". So a successful Allow ALSO records a single-use grant
+  // keyed by the call's normalized-args fingerprint; the handler consumes
+  // that grant immediately before dispatch. A grant consumed with a
+  // different fingerprint (arguments swapped after Allow), twice (replay),
+  // or never recorded (a handler invoked without passing the gate) fails
+  // with a distinguishable reason instead of dispatching.
+  recordApprovalGrant(fingerprint, info = {}) {
+    if (!this._approvalGrants) this._approvalGrants = new Map();
+    this._approvalGrants.set(fingerprint, { ...info, used: false });
+  }
+
+  consumeApprovalGrant(fingerprint) {
+    const entry = this._approvalGrants ? this._approvalGrants.get(fingerprint) : undefined;
+    if (!entry) return { ok: false, reason: "unknown_grant" };
+    if (entry.used) return { ok: false, reason: "grant_replayed" };
+    entry.used = true;
+    return { ok: true, info: entry };
   }
 }

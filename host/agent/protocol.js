@@ -174,6 +174,23 @@ export const AGENT_MESSAGE_TYPES = Object.freeze({
   // rather than hanging or failing silently.
   ENHANCE_PROMPT: "enhance_prompt",
 
+  // Recording attachment claim (upgrade-agent-reliability-and-workflows
+  // tasks.md 6.1/6.3): the panel selects one IDLE conversation for one
+  // finished recording and sends an idempotency key. Same additive,
+  // no-version-bump convention as ENHANCE_PROMPT above: an older companion
+  // answers unknown_message_type rather than hanging. Wire shape:
+  //   panel -> companion  {v, type:"recording_attach", requestId,
+  //                         recording_id, conversation_id, idempotency_key, ts}
+  //   companion -> panel  {v, type:"recording_attach", requestId, ok:true,
+  //                         result:{state}, ts}  (state: selected|attached|…)
+  //   companion -> panel  {v, type:"recording_attach", requestId, ok:false,
+  //                         error:{code, message}, ts}
+  // The claim itself lives in host/agent/storage/recording-attachments.js;
+  // this constant only names the envelope. The background.js relay and the
+  // companion-side handler are outstanding wiring (recorded as residuals in
+  // tasks.md 6.3/6.6), not claimed here.
+  RECORDING_ATTACH: "recording_attach",
+
   ERROR: "error"
 });
 
@@ -275,6 +292,66 @@ export function validateStartEffort(value) {
     return { ok: false, reason: "effort_unsupported_level" };
   }
   return { ok: true, effort: value };
+}
+
+/**
+ * Validate START's optional run-scoped usage overrides (tasks.md 5.1
+ * inheritance: a run override wins per-field over the conversation policy).
+ * Absent means "inherit the conversation policy untouched". Present fields
+ * follow the same ranges as storage/conversation-metadata.js's
+ * validateBudgetPolicy (single authority for the numbers lives there; this
+ * only shapes the wire).
+ *
+ * @returns {{ok: true, usage: {maxTurns:number|null, maxBudgetUsd:number|null, wallClockDeadlineMs:number|null}}
+ *          | {ok: false, reason: string}}
+ */
+export function validateStartUsage(value) {
+  if (value === undefined || value === null) {
+    return { ok: true, usage: { maxTurns: null, maxBudgetUsd: null, wallClockDeadlineMs: null } };
+  }
+  if (typeof value !== "object" || Array.isArray(value)) return { ok: false, reason: "malformed_usage" };
+  const allowed = ["maxTurns", "maxBudgetUsd", "wallClockDeadlineMs"];
+  for (const key of Object.keys(value)) {
+    if (!allowed.includes(key)) return { ok: false, reason: `malformed_usage_unknown_field:${key}` };
+  }
+  const out = { maxTurns: null, maxBudgetUsd: null, wallClockDeadlineMs: null };
+  const { maxTurns, maxBudgetUsd, wallClockDeadlineMs } = value;
+  if (maxTurns !== undefined && maxTurns !== null) {
+    if (!Number.isInteger(maxTurns) || maxTurns < 1 || maxTurns > 1000) return { ok: false, reason: "malformed_usage_max_turns" };
+    out.maxTurns = maxTurns;
+  }
+  if (maxBudgetUsd !== undefined && maxBudgetUsd !== null) {
+    if (typeof maxBudgetUsd !== "number" || !Number.isFinite(maxBudgetUsd) || maxBudgetUsd < 0.01 || maxBudgetUsd > 10000) {
+      return { ok: false, reason: "malformed_usage_max_budget" };
+    }
+    out.maxBudgetUsd = maxBudgetUsd;
+  }
+  if (wallClockDeadlineMs !== undefined && wallClockDeadlineMs !== null) {
+    if (typeof wallClockDeadlineMs !== "number" || !Number.isFinite(wallClockDeadlineMs) || wallClockDeadlineMs < 1000 || wallClockDeadlineMs > 86400000) {
+      return { ok: false, reason: "malformed_usage_wall_clock" };
+    }
+    out.wallClockDeadlineMs = wallClockDeadlineMs;
+  }
+  return { ok: true, usage: out };
+}
+
+/**
+ * Validate a `recording_attach` claim envelope body (tasks.md 6.1/6.3).
+ * All three fields are required non-empty strings — an unattributable claim
+ * can never be deduped or owned, so it fails closed here rather than
+ * reaching the store.
+ *
+ * @returns {{ok: true, claim: {recordingId, conversationId, idempotencyKey}} | {ok: false, reason: string}}
+ */
+export function validateRecordingAttach(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { ok: false, reason: "malformed_recording_attach" };
+  const recordingId = value.recording_id ?? value.recordingId;
+  const conversationId = value.conversation_id ?? value.conversationId;
+  const idempotencyKey = value.idempotency_key ?? value.idempotencyKey;
+  if (typeof recordingId !== "string" || !recordingId) return { ok: false, reason: "malformed_recording_attach_id" };
+  if (typeof conversationId !== "string" || !conversationId) return { ok: false, reason: "malformed_recording_attach_conversation" };
+  if (typeof idempotencyKey !== "string" || !idempotencyKey) return { ok: false, reason: "malformed_recording_attach_key" };
+  return { ok: true, claim: { recordingId, conversationId, idempotencyKey } };
 }
 
 /**

@@ -93,6 +93,18 @@ export function createSettingsClient(opts = {}) {
     removeCredential: (profileId) => call("remove_credential", { profileId }),
     testCapability: (profileId, modelId) => call("test_capability", { profileId, modelId }),
     discoverModels: (profileId) => call("discover_models", { profileId }),
-    exportProfile: (profileId) => call("export_profile", { profileId })
+    exportProfile: (profileId) => call("export_profile", { profileId }),
+    // Named-profile collection ops (P2, task 9.2): same `agent_settings`
+    // transport, routed by the background relay to
+    // host/agent/settings/profile-protocol.js's dispatchProfileCollectionOp.
+    // Selection sends only profile id/model id; the companion resolves the
+    // credential and snapshots it for the run. Until the relay maps these
+    // ops, every call rejects with NETWORK_ERROR — never false success.
+    listProfiles: () => call("list_profiles", {}),
+    getSelected: () => call("get_selected", {}),
+    createProfile: (input) => call("create_profile", { ...(input || {}) }),
+    updateProfile: (profileId, patch) => call("update_profile", { profileId, ...(patch || {}) }),
+    deleteProfile: (profileId) => call("delete_profile", { profileId }),
+    selectProfile: (profileId) => call("select_profile", { profileId })
   };
 }

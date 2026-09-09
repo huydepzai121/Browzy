@@ -61,6 +61,77 @@ export const DEFAULT_BUDGET_POLICY = Object.freeze({
   wallClockDeadlineMs: null
 });
 
+// Validation ranges for a run/conversation usage policy (tasks.md 5.1).
+// `maxTurns`: a positive integer SDK agent-loop cap (gate-0.2 G6: this caps
+// internal tool-loop rounds, NOT paced streaming-input conversation turns —
+// the local admission counter stays authoritative regardless).
+// `maxBudgetUsd`: a positive finite USD estimate for the SDK's estimated
+// query-budget stop (gate-0.2 G7: the stop lands AFTER the turn that crosses
+// the cap — in-flight overrun is real — and the figure is an SDK cost-table
+// estimate, never a provider billing ceiling).
+// `wallClockDeadlineMs`: a positive finite local wall-clock admission
+// deadline in milliseconds from run start.
+export const BUDGET_POLICY_LIMITS = Object.freeze({
+  maxTurns: { min: 1, max: 1000, integer: true },
+  maxBudgetUsd: { min: 0.01, max: 10000 },
+  wallClockDeadlineMs: { min: 1000, max: 24 * 60 * 60 * 1000 }
+});
+
+/**
+ * Validate a run- or conversation-scoped usage policy (tasks.md 5.1).
+ * Unknown fields are rejected rather than silently dropped, so a caller can
+ * never believe a limit applies when it was ignored. `null`/`undefined`
+ * values mean "no limit configured", never zero.
+ *
+ * @param {object|null} policy
+ * @returns {{ok: true, policy: {maxTurns:number|null, maxBudgetUsd:number|null, wallClockDeadlineMs:number|null}}
+ *          | {ok: false, reason: string}}
+ */
+export function validateBudgetPolicy(policy) {
+  if (policy === undefined || policy === null) return { ok: true, policy: { ...DEFAULT_BUDGET_POLICY } };
+  if (typeof policy !== "object" || Array.isArray(policy)) return { ok: false, reason: "budget_policy_not_an_object" };
+  const allowed = Object.keys(DEFAULT_BUDGET_POLICY);
+  for (const key of Object.keys(policy)) {
+    if (!allowed.includes(key)) return { ok: false, reason: `budget_policy_unknown_field:${key}` };
+  }
+  const out = { ...DEFAULT_BUDGET_POLICY };
+  for (const key of allowed) {
+    const value = policy[key];
+    if (value === undefined || value === null) {
+      out[key] = null;
+      continue;
+    }
+    if (typeof value !== "number" || !Number.isFinite(value)) return { ok: false, reason: `budget_policy_invalid:${key}` };
+    const limits = BUDGET_POLICY_LIMITS[key];
+    if (limits.integer && !Number.isInteger(value)) return { ok: false, reason: `budget_policy_invalid:${key}` };
+    if (value < limits.min || value > limits.max) return { ok: false, reason: `budget_policy_out_of_range:${key}` };
+    out[key] = value;
+  }
+  return { ok: true, policy: out };
+}
+
+/**
+ * Resolve the effective limits for one run (tasks.md 5.1 inheritance):
+ * a run-scoped override wins per-field over the conversation policy; an
+ * unset override field inherits the conversation value. Neither input is
+ * mutated; both must already be normalized (validateBudgetPolicy output or
+ * DEFAULT_BUDGET_POLICY shape).
+ *
+ * @param {object|null} conversationPolicy
+ * @param {object|null} runOverride
+ * @returns {{maxTurns:number|null, maxBudgetUsd:number|null, wallClockDeadlineMs:number|null}}
+ */
+export function resolveEffectiveLimits(conversationPolicy, runOverride) {
+  const conv = conversationPolicy || { ...DEFAULT_BUDGET_POLICY };
+  const over = runOverride || {};
+  const out = {};
+  for (const key of Object.keys(DEFAULT_BUDGET_POLICY)) {
+    const o = over[key];
+    out[key] = o === undefined || o === null ? (conv[key] ?? null) : o;
+  }
+  return out;
+}
+
 function freshMigrationState({ backfilled, legacy }) {
   return {
     schemaVersion: CONVERSATION_METADATA_SCHEMA_VERSION,

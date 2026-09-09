@@ -67,9 +67,37 @@ function sameTarget(a, b) {
 // comparing them at Send time rejects a send against the very same document
 // the user is looking at — and on a page whose title keeps changing, every
 // retry is rejected too and the message can never be sent.
+//
+// Tasks.md 7.1/7.2 (upgrade-agent-reliability-and-workflows decision 6):
+// identity additionally carries the minimum DOCUMENT identity — the
+// content-script-confirmed generation + docNonce from
+// extension/events/document-identity.js — whenever a doc channel is
+// available. A same-URL reload (new docNonce) and an SPA route change (same
+// docNonce, bumped generation) are both new REVISIONS requiring
+// revalidation, even though the URL string may not have changed at all.
+// Comparison is three-valued:
+//   - both sides confirmed: same docNonce AND same generation, else changed;
+//   - live side confirmed, latched side not (maturation: the handshake
+//     completed between display and Send): NOT changed — binding the now-
+//     confirmed document is strictly better, and flagging it would force a
+//     pointless double-Send after every navigation;
+//   - latched side confirmed, live side not (mid-flight navigation, close,
+//     restricted page): changed — the send would bind an unconfirmed or
+//     missing document, so the chip must refresh and the user re-sends;
+//   - either side without doc info at all: tabId+url decide exactly as before
+//     (never fail a send merely because the doc channel is unavailable —
+//     unavailability is reported in the snapshot's `doc` field so the host
+//     can apply its own fail-closed read/mutation guards instead).
 function sameIdentity(a, b) {
   if (!a || !b) return a === b;
-  return a.tabId === b.tabId && a.url === b.url;
+  if (a.tabId !== b.tabId || a.url !== b.url) return false;
+  const da = a.doc && a.doc.confirmed ? a.doc : null;
+  const liveConfirmed = b.doc && b.doc.confirmed ? b.doc : null;
+  if (da && liveConfirmed) {
+    return da.docNonce === liveConfirmed.docNonce && da.generation === liveConfirmed.generation;
+  }
+  if (da && !liveConfirmed) return false;
+  return true;
 }
 
 export class PageContextTracker {
@@ -77,15 +105,36 @@ export class PageContextTracker {
    * @param {object} [deps]
    * @param {number} [deps.windowId] - the window this panel is attached to.
    * @param {object} [deps.tabsApi] - {query, get, onActivated:{addListener}, onUpdated:{addListener}} — defaults to chrome.tabs.
+   * @param {object} [deps.docIdentity] - tasks.md 7.1/7.2: the minimum
+   *   document-identity channel, `{ getBinding(tabId) }` returning
+   *   `{ confirmed, generation, docNonce } | null` (the shape
+   *   extension/events/document-identity.js's `getBinding()` returns,
+   *   consumed read-only here). Null/absent means "no doc channel" — the
+   *   tracker keeps its tabId+url behavior and reports `doc: null` so
+   *   consumers know document revalidation was unavailable rather than
+   *   clean. Production wiring of this seam (background relay of the
+   *   content-script handshake into the panel) is outstanding — see tasks.md
+   *   7.4's residual — nothing here fabricates a binding when it is absent.
    */
-  constructor({ windowId, tabsApi } = {}) {
+  constructor({ windowId, tabsApi, docIdentity } = {}) {
     this._windowId = windowId ?? null;
     this._tabs = tabsApi || (typeof chrome !== "undefined" ? chrome.tabs : null);
+    this._docIdentity = docIdentity || null;
     this._pinnedTabId = null;
     this._current = null; // {tabId, url, title, hostname, favIconUrl}
     this._revision = 0;
     this._explicitlyRemoved = false;
     this._listeners = new Set();
+    // Tasks.md 7.2: the document identity LATCHED the last time `_current`
+    // was (re)set from the tab cache — i.e. what the displayed chip was
+    // bound to. captureForSend() compares this latch against the live doc
+    // channel: a replacement between display and Send (reload, SPA revision,
+    // close, mid-flight navigation) reports changed:true. The latch is
+    // deliberately NOT refreshed by snapshot() — snapshot() reports live
+    // truth for display, while only a tab-cache refresh (the same moments
+    // the chip itself would re-render) re-latches. Maturation
+    // (unconfirmed -> confirmed) is not a replacement — see sameIdentity().
+    this._latchedDoc = null;
   }
 
   onChange(fn) {
@@ -103,7 +152,36 @@ export class PageContextTracker {
       ...this._current,
       pinned: this._pinnedTabId === this._current.tabId,
       restricted: isRestrictedUrl(this._current.url),
-      revision: this._revision
+      revision: this._revision,
+      // Tasks.md 7.1: the minimum document identity for the CURRENT tab, or
+      // null when the doc channel is unavailable (or knows nothing about
+      // this tab — e.g. a restricted page whose handshake never completes).
+      // `docNonce` is exposed only when confirmed; an unconfirmed generation
+      // is reported as-is so the host can fail its own read/mutation guards
+      // closed rather than trusting tabId+url alone.
+      doc: this._docSnapshot(this._current.tabId)
+    };
+  }
+
+  /**
+   * Read-only pull of the current document binding for one tab. Never throws
+   * (a failing channel degrades to "unavailable", never to a fabricated
+   * binding) and never invents a nonce — whatever `getBinding` returns is
+   * passed through, including its `confirmed: false`.
+   */
+  _docSnapshot(tabId) {
+    if (!this._docIdentity || typeof this._docIdentity.getBinding !== "function") return null;
+    let binding = null;
+    try {
+      binding = this._docIdentity.getBinding(tabId);
+    } catch {
+      return null;
+    }
+    if (!binding || typeof binding !== "object") return null;
+    return {
+      generation: binding.generation ?? null,
+      confirmed: binding.confirmed === true,
+      docNonce: binding.confirmed === true && binding.docNonce ? binding.docNonce : null
     };
   }
 
@@ -178,6 +256,7 @@ export class PageContextTracker {
   _clearCurrent() {
     if (this._current) this._revision++;
     this._current = null;
+    this._latchedDoc = null;
   }
 
   _setFromTab(tab) {
@@ -191,6 +270,9 @@ export class PageContextTracker {
     };
     if (!sameTarget(this._current, next)) this._revision++;
     this._current = next;
+    // Re-latch the document identity the chip is now displaying (see the
+    // field comment): captureForSend() diffs this against the live channel.
+    this._latchedDoc = this._docSnapshot(next.tabId);
     this._explicitlyRemoved = false;
   }
 
@@ -233,19 +315,31 @@ export class PageContextTracker {
    *     the corrected chip and require an explicit second Send rather than
    *     silently dispatching the just-discovered new target.
    *
+   * Tasks.md 7.2: both snapshots carry the minimum document identity (see
+   * snapshot()), so a same-URL reload, an SPA route revision, or a tab close
+   * between display and Send also reports `changed: true` — the run binds
+   * the fresh document (or no context at all for a closed tab), never the
+   * replaced one the user was originally looking at.
+   *
    * @returns {Promise<{changed: boolean, context: object|null}>}
    */
   async captureForSend() {
-    const before = this.snapshot();
+    // `before` is what the chip was DISPLAYED as: the cached tab fields plus
+    // the latched document identity — never the live doc channel, which may
+    // already have moved on (that movement is exactly what this gate must
+    // catch). `after` is live truth. sameIdentity(a=displayed, b=live).
+    const before = this._current
+      ? { ...this.snapshot(), doc: this._latchedDoc }
+      : null;
     if (this._pinnedTabId !== null) {
       await this._loadTab(this._pinnedTabId);
     } else {
       await this._refreshFromActiveTab();
     }
     const after = this.snapshot();
-    // Only a real retarget (different tab, different URL, or the target
-    // disappearing) blocks the send; a refreshed title/favicon on the same
-    // document does not.
+    // Only a real retarget (different tab, different URL, a replaced
+    // document revision, or the target disappearing) blocks the send; a
+    // refreshed title/favicon on the same document does not.
     const changed = !sameIdentity(before, after);
     return { changed, context: after };
   }
