@@ -47,28 +47,35 @@ document would blow the native-messaging message ceiling and would be paid for
 on every reconnect snapshot replay, for a document the operator may never open.
 
 The panel fetches bytes only when the operator opens or downloads a card:
-`document_fetch { conversationId, documentId }` → host reads the file →
-`chunkBuffer()` (`host/agent/broker/chunked-transport.js`, `kind:
-"document_bytes"`) → background reassembles → `Blob`.
+`document_request { conversationId, documentId, requestId }` → host reads the
+file → `chunkBuffer()` (`host/agent/broker/chunked-transport.js`, `kind:
+"document_bytes"`) → the PANEL reassembles → a `Blob`.
+
+Reassembly happens in the panel, not in `background.js`. The worker already
+relays every agent envelope verbatim in both directions, including `chunk_*`,
+so no worker change is needed at all; and `chrome.runtime` messaging is JSON,
+so bytes assembled in the worker could not reach the panel as bytes anyway (a
+`Uint8Array` sent that way arrives as an index-keyed object).
 
 `chunked-transport.js` already implements both halves symmetrically, but the
-extension side only has the **sender** (`chunkBytesForWire` in
-`extension/background.js:1903`). A `Reassembler` counterpart is added in the
-extension, mirroring the host module's envelope validation (id match, index
-order, total bytes, expiry) so a stale or truncated sequence is rejected rather
-than yielding a corrupt blob.
+extension side only had the **sender** (`chunkBytesForWire` in
+`extension/background.js`). `extension/sidepanel/chunk-reassembler.js` is the
+counterpart, mirroring the host module's validation (id match, index order,
+declared total bytes, expiry) so a stale or truncated sequence is rejected
+rather than yielding a corrupt blob.
 
 ## 4. Decision: Preview and Markdown exist for every format
 
 | format | Preview tab | Markdown tab |
 |---|---|---|
 | md | `markdown-lite` → panel DOM (already XSS-safe) | source text |
-| txt / json / csv | `<pre>` (csv also as a table) | fenced source |
-| html | sandboxed iframe `srcdoc` | `turndown` of the HTML |
-| docx | `docx-preview` HTML in a sandboxed iframe | `mammoth` → HTML → `turndown` |
+| txt / json | `<pre>` text node | fenced source |
+| csv | a table built with `createElement`/`textContent` | GFM pipe table |
+| html | sandboxed iframe `srcdoc` | a DOM walk over the parsed document |
+| docx | structure read with fflate + DOMParser, shown as semantic HTML in a sandboxed iframe | the same blocks, as markdown |
 | xlsx | sheet tables in a sandboxed iframe | GFM pipe tables per sheet |
-| pptx | per-slide title + bullets, extracted with `fflate` + XML parse | same, as a markdown outline |
-| pdf | `pdfjs-dist` canvas pages | `pdfjs-dist` text layer joined per page |
+| pptx | per-slide title + bullets, extracted with fflate + DOMParser | the same, as a markdown outline |
+| pdf | pdf.js canvas pages | pdf.js text layer, grouped by baseline, per page |
 
 PPTX has no faithful in-browser renderer. Its Preview is an extraction, and the
 UI says so — an honest limitation beats a silently lossy render.
@@ -81,18 +88,30 @@ into the panel DOM. Every converter's HTML goes into
 so an injected `<script>` cannot run and cannot reach the panel's DOM,
 `chrome.*`, or storage.
 
+`sandbox` stops scripts but NOT the network, and this extension holds
+`<all_urls>`, so a document carrying a remote image would beacon on preview.
+Every rendered document therefore carries
+`default-src 'none'; style-src 'unsafe-inline'; img-src data:` as a policy meta
+— in the panel's preview wrapper, in the host's html generator, and injected
+into the head of a document a run wrote whole — with the iframe's `csp`
+attribute as a second lock. Verified in a real browser against a counting
+endpoint: an unguarded control frame fetched the beacon, the guarded frame did
+not.
+
 ## 5. Decision: lifetime is the conversation
 
-Documents live in the conversation workspace and their card metadata is
-persisted in `history-store.js`, so a panel reload rebuilds a live card whose
-Download and Preview still work. Deleting the conversation deletes the
+Documents live in the conversation workspace. No panel-side persistence was
+needed: `applySnapshot()` already performs a full rebuild of a conversation
+from its persisted event stream, so a reloaded panel gets its cards back from
+the replayed `document_created` events, and Download and Preview still work. Deleting the conversation deletes the
 `documents/` directory. This rules out the "temp file" alternative, where a
 reload leaves dead cards in the transcript.
 
 ## 6. Bundle-size handling
 
-`pdfjs-dist` (with its worker) is the single largest addition. All viewer
-libraries are loaded by dynamic `import()` at the moment a document of that
+pdf.js (with its worker, ~1.8 MB) is the only large viewer library vendored at
+all — see §7 on why mammoth and exceljs were rejected. It and `fflate` are
+loaded by dynamic `import()` at the moment a document of that
 format is first opened, so a session that never opens a PDF never pays for
 pdf.js. The card, the modal shell, and the md/txt/csv/json/html paths carry no
 vendored dependency at all.
@@ -103,8 +122,12 @@ vendored dependency at all.
   vendored file is verified after copying (grep for `eval(`/`new Function`),
   never trusted from its documentation.
 - npm's `xlsx` package (0.18.5) is stale and carries an unpatched
-  prototype-pollution advisory; `exceljs` (MIT, 4.4.0) is used instead on both
-  the host and the panel side.
+  prototype-pollution advisory; `exceljs` (MIT, 4.4.0) is used instead on the
+  HOST side. On the panel side neither ships: measurement found the forbidden
+  dynamic-code constructor in mammoth's browser build (7 sites) and in
+  exceljs's (1), which MV3's CSP refuses, so docx/xlsx/pptx are read with
+  `fflate` plus the panel's own `DOMParser` — which also removes ~1.5 MB from
+  the package.
 - `pptxgenjs` pulls in `image-size`, which carries a denial-of-service
   advisory in its ICNS/JXL/HEIF parsers. That parser only runs when an image is
   added to a slide, and the deck generator here is built from the run's text

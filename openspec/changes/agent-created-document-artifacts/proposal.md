@@ -10,9 +10,13 @@ The Claude Agent SDK ships no vendor-neutral primitive for this. Its `enableArti
 - Formats: `md` (default), `txt`, `csv`, `html`, `json` are written directly with no dependency. `docx`, `xlsx`, `pptx`, `pdf` are generated on the host from the model's markdown/structured content via `docx`, `exceljs`, `pptxgenjs`, `pdf-lib`.
 - New stream event `document_created` carrying id, title, filename, format, mimeType, byteLength — never the bytes. The transcript renders a document card (icon, title, `Document · MD`, a Download control) in place of the Drive dropdown.
 - Clicking the card opens a detail modal with two tabs, **Preview** and **Markdown**, for every format. Preview renders the document; Markdown shows the markdown source, or for a binary format the extracted markdown equivalent. Download writes the real bytes via an `<a download>` blob URL — no `downloads` permission, no network, no Drive.
-- Bytes travel host→panel on demand over the existing chunk wire shape (`host/agent/broker/chunked-transport.js`), which today has no extension-side reassembler; one is added as the symmetric counterpart of the existing extension-side `chunkBytesForWire`.
-- Documents live for the life of the conversation: stored in the conversation workspace, re-openable after a panel reload from the persisted card metadata, removed when the conversation is deleted.
-- Rendering libraries are vendored under `extension/vendor/` (precedent: rrweb). Any HTML produced by a document converter is untrusted content and is rendered inside a sandboxed iframe, never injected into the panel DOM; only `markdown-lite` output reaches the panel DOM.
+- Bytes travel host→panel on demand over the existing chunk wire shape
+(`host/agent/broker/chunked-transport.js`), which had no extension-side
+reassembler; one is added in the PANEL as the symmetric counterpart of the
+existing extension-side `chunkBytesForWire`. `background.js` needs no change:
+it already relays every agent envelope verbatim in both directions.
+- Documents live for the life of the conversation: stored in the conversation workspace, re-openable after a panel reload (a reconnect replays the conversation's event stream, so the cards come back with it), removed when the conversation is deleted.
+- Rendering libraries are vendored (precedent: rrweb), but only two: pdf.js and `fflate`. mammoth and exceljs were measured and rejected — their browser builds use the dynamic-code constructor MV3's CSP refuses — so Word, Excel and PowerPoint are read with fflate plus the panel's own DOMParser. Any HTML a converter produces is untrusted content, rendered inside a sandboxed iframe carrying `default-src 'none'`, never injected into the panel DOM; only `markdown-lite` output reaches the panel DOM.
 
 ## Capabilities
 
@@ -27,7 +31,7 @@ The Claude Agent SDK ships no vendor-neutral primitive for this. Its `enableArti
 
 ## Impact
 
-- Host: `host/agent/tools/create-document.js` (new), `host/agent/documents/store.js` (new), `host/agent/documents/render/*.js` (new generators), registration in `host/agent/companion.js`, tool-name allowlist in `host/agent/tools/query-options.js`, a `document_fetch` wire handler, `host/package.json` dependencies (`docx`, `exceljs`, `pptxgenjs`, `pdf-lib`).
-- Extension: chunk reassembler + `document_fetch` relay in `extension/background.js`; `document_created` item in `extension/sidepanel/conversation-model.js`; card + modal in `extension/sidepanel/sidepanel.js` / `sidepanel.html` / `sidepanel.css`; persisted card metadata in `history-store.js`; Vietnamese label in `tool-labels.js`; vendored viewers in `extension/vendor/`.
+- Host: `host/agent/tools/create-document.js` (new), `host/agent/documents/store.js` (new), `host/agent/documents/render/*.js` (new generators), registration in `host/agent/companion.js`, tool-name allowlist in `host/agent/tools/query-options.js`, a `document_request` wire handler, `host/package.json` dependencies (`docx`, `exceljs`, `pptxgenjs`, `pdf-lib`, plus `@pdf-lib/fontkit` and `dejavu-fonts-ttf` — the PDF standard fonts are WinAnsi and cannot encode Vietnamese at all).
+- Extension: chunk reassembler and fetch client under `extension/sidepanel/`; `document_created` item in `conversation-model.js`; card + modal in `sidepanel.js` / `sidepanel.html` / `sidepanel.css`; per-format viewers in `extension/sidepanel/viewers/`; Vietnamese labels in `tool-labels.js`; pdf.js and `fflate` vendored.
 - Tests: new unit suites for filename/size normalization, the document store, each generator's magic bytes, the reassembler, and the conversation-model item. Existing suites stay green.
 - Out of scope: editing a document after creation, syncing to any cloud service, sharing links, and any change to `HIGH_RISK_BUILTINS`.

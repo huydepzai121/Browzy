@@ -271,6 +271,28 @@ await test("the tool is bound to its own conversation, not to anything in args",
   assert(new DocumentStore().list(mine).length === 1, "the document landed in the bound conversation");
 });
 
+// --- lifetime -------------------------------------------------------------
+
+await test("deleting a conversation takes its documents with it", async () => {
+  // The lifetime promise the spec makes: a document lives exactly as long as
+  // its conversation. Asserted against the real SessionManager rather than by
+  // reading that its rmSync covers the directory.
+  const { SessionManager } = await import("../agent/session/manager.js");
+  const { TranscriptStore } = await import("../agent/storage/transcript-store.js");
+  const manager = new SessionManager({ store: new TranscriptStore() });
+  const conversationId = manager.newConversation();
+
+  const store = new DocumentStore();
+  const record = await store.write({ conversationId, title: "Sẽ bị xoá", content: "x" });
+  assert(store.read(conversationId, record.documentId).found === true, "the document exists first");
+  assert(fs.existsSync(conversationDocumentsDir(conversationId)), "the documents directory exists first");
+
+  manager.deleteConversation(conversationId);
+  assert(!fs.existsSync(conversationDocumentsDir(conversationId)), "the documents directory outlived its conversation");
+  const gone = store.read(conversationId, record.documentId);
+  assert(gone.found === false, "the document is still readable after its conversation was deleted");
+});
+
 const failed = results.filter((r) => !r.ok);
 console.log(
   `\n${results.length - failed.length}/${results.length} passed` +

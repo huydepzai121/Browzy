@@ -2500,9 +2500,17 @@ function paintDocumentView(container, view, signal) {
       // Untrusted by definition. No allow-scripts, no allow-same-origin: the
       // frame cannot run code, cannot reach this document, and cannot read
       // extension storage.
+      //
+      // `sandbox` stops scripts; it does NOT stop the network, and this
+      // extension holds <all_urls>. A document carrying an <img> pointed at an
+      // attacker would beacon on preview. The rendered document carries its own
+      // policy meta (viewers/ooxml.js, and the host's html generator); this
+      // attribute is the second lock on the same door, for the case of a
+      // document that arrived with a head this panel did not write.
       const frame = document.createElement("iframe");
       frame.className = "doc-frame";
       frame.setAttribute("sandbox", "");
+      frame.setAttribute("csp", "default-src 'none'; style-src 'unsafe-inline'; img-src data:");
       frame.setAttribute("referrerpolicy", "no-referrer");
       frame.srcdoc = view.html;
       container.appendChild(frame);

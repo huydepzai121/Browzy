@@ -358,6 +358,20 @@ list/attach/start/stop — all screenshot-verified at 320/400/480px in light and
 dark (`reports/05-panel-evidence.md`, `reports/05-visual-system.md`) — plus
 composer prompt enhancement (the "Cải thiện prompt" control next to Send).
 
+**Documents the agent creates.** When a run produces something that is a
+document in its own right — a report, an audit, a data table, a set of slides —
+it calls the application-owned `create_document` tool instead of pasting the
+whole thing into the transcript, and the panel shows a card
+("Tên tài liệu · Tài liệu · MD · 12 KB"). Clicking it opens a viewer with two
+tabs, **Xem trước** and **Markdown**, for every format; the download control
+saves the real file locally. Formats: `md`, `txt`, `csv`, `html`, `json`,
+`docx`, `xlsx`, `pptx`, `pdf`. Nothing is uploaded anywhere — the file lives in
+that conversation's own directory and the download is a local blob, so no cloud
+account and no `downloads` permission is involved. This does NOT widen the
+filesystem boundary: `Bash`, `Write`, `Edit` and `NotebookEdit` stay disabled,
+and the model never names a path — the host derives the filename from the title
+and owns the directory.
+
 Still in development, not yet in the shipped panel — mentioned here so this
 document never promises more than what's built:
 

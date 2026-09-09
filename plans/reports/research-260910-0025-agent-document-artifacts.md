@@ -196,6 +196,33 @@ Lưu ý về môi trường kiểm thử: khi tab đang ẩn, Chrome chặn `req
 nên pdf.js không bao giờ hoàn tất render — đó là giới hạn của tab ẩn, không phải
 lỗi sản phẩm; đưa tab ra hiển thị thì render xong ngay.
 
+### 5.4 Chặn beacon: đo bằng endpoint đếm lượt
+
+`sandbox` của iframe chặn script nhưng **không chặn mạng**, trong khi extension
+giữ `<all_urls>`. Một tài liệu chứa `<img src="https://…/?leak=1">` sẽ gọi ra
+ngoài ngay khi xem trước. Đã thêm meta CSP
+`default-src 'none'; style-src 'unsafe-inline'; img-src data:` vào: bộ bọc xem
+trước của panel, bộ sinh HTML của host, và chèn vào `<head>` của tài liệu do
+agent tự viết trọn; kèm thuộc tính `csp` trên iframe làm lớp khoá thứ hai.
+
+Đo trên Chrome thật với endpoint đếm lượt truy cập:
+
+| Khung | Kết quả |
+|---|---|
+| Đối chứng, **không** có CSP | beacon được tải (+1 lượt) |
+| Khung xem trước có CSP | **0 lượt** |
+
+Khung đối chứng là phần quan trọng: nó chứng minh phép đo có khả năng phát hiện
+rò rỉ, nên con số 0 kia mới có nghĩa.
+
+### 5.5 Đường đi hoàn chỉnh panel ↔ companion
+
+`test/sidepanel-fake-companion.test.mjs` giờ chạy trọn vẹn: `ProtocolClient`
+thật gửi `document_request`, `CompanionCore` thật trả về chuỗi
+`{ multi: [...] }`, `PanelController` thật ghép lại — tài liệu 1,5 MB về đúng
+từng byte. Harness cũng đã được sửa để tách `multi` thành nhiều thông điệp
+riêng, đúng như IPC thật làm; trước đó nó mô phỏng một đường dây không tồn tại.
+
 ## Việc còn lại
 
 Chỉ còn một cửa ải: chạy tay trên extension đã nạp lại — hỏi agent tạo một báo

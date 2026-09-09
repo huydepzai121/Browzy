@@ -156,7 +156,19 @@ function makeBridgeTransport(core) {
     postMessage: (msg) => {
       if (!msg || msg.type !== "agent_msg" || !msg.envelope) return;
       Promise.resolve(core.handleEnvelope(msg.envelope)).then((reply) => {
-        if (reply) deliver(reply);
+        if (!reply) return;
+        // A `{ multi: [...] }` reply is not one envelope but an ORDERED
+        // SEQUENCE of them (the chunked byte replies — a screenshot artifact,
+        // an agent-created document). The real IPC glue sends each part as its
+        // own native message (see companion.js's runAsForkedChild), which is
+        // what keeps a large payload under Chrome's message ceiling; a harness
+        // that handed the panel one object with a `multi` key would model a
+        // wire that does not exist and would never exercise reassembly.
+        if (Array.isArray(reply.multi)) {
+          for (const part of reply.multi) deliver(part);
+          return;
+        }
+        deliver(reply);
       });
     },
     onMessage: { addListener: (fn) => msgListeners.push(fn) },
@@ -465,6 +477,37 @@ async function main() {
     const turn = panel2.currentModel().items.find((i) => i.kind === "assistant_turn");
     ok(turn.complete === false, "an interrupted run's partial content is never marked complete");
     ok(turn.text === "đang xử lý", "the partial text from before the restart is preserved");
+  }
+
+  console.log("== an agent-created document's bytes cross the whole panel<->companion path ==");
+  {
+    // This is the seam nothing else covers: DocumentsClient's own tests feed it
+    // envelopes by hand, and the host's wire test stops at the native message.
+    // Here the request leaves the real ProtocolClient, the real CompanionCore
+    // answers with its chunked `{ multi: [...] }` reply, and the real
+    // PanelController reassembles it — the assembled path, minus only the DOM.
+    const core = buildCore({ sdk: fakeSdk([{ type: "result", subtype: "success", result: "" }]) });
+    const panel = buildPanel(core);
+    await panel.init();
+    await waitUntil(() => panel.protocol.handshakeState() === "ok");
+    await panel.startNewConversation();
+    await waitUntil(() => panel.currentConversationId != null);
+    const conversationId = panel.currentConversationId;
+
+    const { DocumentStore } = await import("../host/agent/documents/store.js");
+    // Comfortably over one chunk (700_000 bytes), so the reply really is a
+    // sequence rather than a single envelope that would prove nothing.
+    const body = `# Báo cáo\n\n${"nội dung dài ".repeat(70_000)}`;
+    const record = await new DocumentStore().write({ conversationId, title: "Báo cáo dài", format: "md", content: body });
+
+    const result = await panel.fetchDocument(record.documentId, conversationId);
+    ok(result.found === true, `the document fetch resolves found (${result.reason || ""})`);
+    ok(result.bytes.length === record.byteLength, "the reassembled length matches what the host stored");
+    ok(new TextDecoder().decode(result.bytes).startsWith("# Báo cáo"), "the reassembled bytes are the document");
+    ok(result.meta.fileName === record.fileName, "the card's filename came back with the bytes");
+
+    const missing = await panel.fetchDocument("never-created", conversationId);
+    ok(missing.found === false && missing.reason === "not_found", `an unknown document reports not_found (${missing.reason})`);
   }
 
   console.log(fail === 0 ? "\nALL SIDEPANEL FAKE-COMPANION TESTS PASSED" : `\n${fail} FAILED`);

@@ -2,12 +2,12 @@
 
 ### Requirement: A created document appears in the transcript as a card
 
-When a run creates a document, the transcript SHALL show a document card in place of the raw content: a file icon, the document title, a `Document · <FORMAT>` subtitle, and a download control. The card SHALL be reachable and operable by keyboard, and SHALL use the panel's existing design tokens. The card SHALL NOT offer, mention, or require any third-party storage service.
+When a run creates a document, the transcript SHALL show a document card in place of the raw content: a file icon, the document title, a subtitle naming its kind, its format and its size, and a download control. The card SHALL be reachable and operable by keyboard, and SHALL use the panel's existing design tokens. The card SHALL NOT offer, mention, or require any third-party storage service.
 
 #### Scenario: The agent produces a report
 
 - **WHEN** a run creates a markdown document titled "Phan tich dauthau asia"
-- **THEN** the transcript shows a card reading that title with the subtitle `Document · MD` and a download control, and the document's full text is not dumped inline
+- **THEN** the transcript shows a card reading that title with a subtitle naming it as a document, its format (MD) and its size and a download control, and the document's full text is not dumped inline
 
 #### Scenario: Downloading saves the real file locally
 
@@ -41,3 +41,8 @@ Document content originates from model output and, transitively, from page conte
 
 - **WHEN** a document contains a `<script>` element or an event-handler attribute
 - **THEN** neither executes, and neither reaches the panel's DOM, extension APIs, or storage
+
+#### Scenario: A document containing a remote image does not phone home
+
+- **WHEN** a document contains a reference to a remote resource, such as an image pointed at an external host
+- **THEN** no request for it leaves the browser when the document is previewed
