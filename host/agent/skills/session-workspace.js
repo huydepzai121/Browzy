@@ -147,8 +147,27 @@ function copyDirRecursive(srcDir, destDir) {
  * this module copies only approved snapshots into the session's own plugin
  * directory in the first place, rather than trusting the SDK option alone.
  *
+ * Also materializes this session's own isolated Claude Code CLI config
+ * directory (`configDir`, `${sessionWorkspaceDir}/claude-config/`) and
+ * returns it alongside the plugin fields. `query-options.js`'s
+ * `buildIsolatedOptions()` requires it and sets `CLAUDE_CONFIG_DIR` to it in
+ * the isolated `env` it builds for `query()`. Without an explicit
+ * `CLAUDE_CONFIG_DIR`, the installed SDK's bundled CLI subprocess falls back
+ * to `path.join(homedir(), ".claude")` (confirmed by reading the installed
+ * `sdk.mjs`) and writes real session `.jsonl` files into the OPERATOR's own
+ * `~/.claude/projects/<encoded-cwd>/`, interleaved with their real Claude
+ * Code CLI history — a real, reproduced isolation leak (see this change's
+ * Part A evidence report), the write-path counterpart of decision 9's
+ * read-path `settingSources` leak this file's own header already documents.
+ * Scoping it per session workspace (rather than one shared directory for the
+ * whole product) also means a session id minted under one conversation's
+ * `CLAUDE_CONFIG_DIR` can never be found by a `resume` call issued under a
+ * different conversation's `configDir` — the on-disk session store is keyed
+ * by `(CLAUDE_CONFIG_DIR, encoded cwd)`, so this is a real, load-bearing
+ * isolation property for any future SDK-`resume` use, not merely tidiness.
+ *
  * @param {string} sessionWorkspaceDir
- * @returns {Promise<{ skillsDir: string, pluginDir: string, allowedSkillNames: string[], catalogSnapshot: object[], skillOverrides: Record<string, string> }>}
+ * @returns {Promise<{ skillsDir: string, pluginDir: string, configDir: string, allowedSkillNames: string[], catalogSnapshot: object[], skillOverrides: Record<string, string> }>}
  */
 export async function buildSessionSkills(sessionWorkspaceDir) {
   const catalog = await listCatalog();
@@ -160,6 +179,13 @@ export async function buildSessionSkills(sessionWorkspaceDir) {
   const skillsDir = path.join(pluginDir, "skills");
   fs.mkdirSync(skillsDir, { recursive: true });
   writePluginManifest(pluginDir);
+
+  // This session's own isolated Claude Code CLI config directory — see the
+  // docstring above. Created eagerly (mirroring skillsDir just above) so it
+  // always exists by the time buildIsolatedOptions() reads it, even for a
+  // session with zero approved skills.
+  const configDir = path.join(sessionWorkspaceDir, "claude-config");
+  fs.mkdirSync(configDir, { recursive: true });
 
   const allowedSkillNames = [];
   const catalogSnapshot = [];
@@ -190,7 +216,7 @@ export async function buildSessionSkills(sessionWorkspaceDir) {
     catalogSnapshot.push(JSON.parse(JSON.stringify(skill)));
   }
 
-  return { skillsDir, pluginDir, allowedSkillNames, catalogSnapshot, skillOverrides };
+  return { skillsDir, pluginDir, configDir, allowedSkillNames, catalogSnapshot, skillOverrides };
 }
 
 /**

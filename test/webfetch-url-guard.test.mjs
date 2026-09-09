@@ -175,7 +175,7 @@ function fakeSnapshot() {
   return { model: "claude-x", env: { ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "https://x" } };
 }
 function fakeSkills() {
-  return { cwd: "/scratch/conv-webfetch-shape", allowedSkillNames: [], skillOverrides: {} };
+  return { cwd: "/scratch/conv-webfetch-shape", configDir: "/scratch/conv-webfetch-shape/claude-config", allowedSkillNames: [], skillOverrides: {} };
 }
 
 {

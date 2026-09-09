@@ -1236,6 +1236,27 @@ export class CompanionCore {
     const existing = this.sessionManager.getSkillsBinding(conversationId);
     if (existing) {
       await assertResumeSnapshotAvailable(existing.catalogSnapshot);
+      if (!existing.configDir) {
+        // Backfill for a binding persisted before this session's own
+        // isolated Claude Code CLI config directory existed (see Part A of
+        // upgrade-agent-reliability-and-workflows: host/agent/skills/
+        // session-workspace.js's buildSessionSkills() now always returns
+        // one). Without this, an already-bound conversation's next run
+        // would hit buildIsolatedOptions()'s required-configDir check and
+        // fail outright — a real regression for real persisted
+        // conversations on disk, not a hypothetical. This never
+        // re-materializes skills (that would defeat the existing "a
+        // refresh during an active run leaves that run on its existing
+        // snapshot" guarantee just above) — it only adds the missing
+        // isolated config directory using the exact same
+        // `${cwd}/claude-config` shape buildSessionSkills() uses for a
+        // fresh binding.
+        const configDir = path.join(existing.cwd, "claude-config");
+        fs.mkdirSync(configDir, { recursive: true });
+        const migrated = { ...existing, configDir };
+        this.sessionManager.setSkillsBinding(conversationId, migrated);
+        return migrated;
+      }
       return existing;
     }
     const workspaceDir = conversationDir(conversationId);

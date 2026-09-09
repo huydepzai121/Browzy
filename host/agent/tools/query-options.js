@@ -475,7 +475,7 @@ export async function resolveProfileSnapshot({ profileId, modelId, profileProvid
  * @param {object} params.skills - this run's bound skills session, as produced by
  *   host/agent/companion.js's `_bindSkillsForRun()` (which wraps
  *   host/agent/skills/index.js's `buildSessionSkills()`):
- *   { cwd: string, pluginDir: string, allowedSkillNames: string[], skillOverrides: Record<string, string> }.
+ *   { cwd: string, pluginDir: string, configDir: string, allowedSkillNames: string[], skillOverrides: Record<string, string> }.
  *   `cwd` MUST be the session workspace directory passed to
  *   `buildSessionSkills()` - required, not optional, so a session can never
  *   silently reach query() without having gone through the
@@ -485,7 +485,14 @@ export async function resolveProfileSnapshot({ profileId, modelId, profileProvid
  *   holding the approved snapshots) - this is what makes the plugin
  *   discoverable at all (see the `plugins` option below); `allowedSkillNames`
  *   now carries each skill's plugin-qualified canonical name (design.md
- *   decision 9), not the bare name.
+ *   decision 9), not the bare name. `configDir` is that same session's own
+ *   isolated Claude Code CLI config directory (`buildSessionSkills()`'s
+ *   `${sessionWorkspaceDir}/claude-config/`) - also required, not optional,
+ *   for the identical "never silently reach query()" reason as `cwd`: without
+ *   an explicit `CLAUDE_CONFIG_DIR`, the installed SDK's bundled CLI
+ *   subprocess falls back to the OPERATOR's own `~/.claude` and writes real
+ *   session `.jsonl` files into their actual Claude Code CLI history (a real,
+ *   reproduced isolation leak - see this change's Part A evidence report).
  * @param {object|null} [params.pageContext] - this run's bound page-context
  *   metadata, forwarded verbatim from the `start` envelope's `context` field
  *   (see this file's "Bound page-context channel" section above). Rendered
@@ -541,8 +548,15 @@ export function buildIsolatedOptions({
   }
   if (!skills || typeof skills !== "object" || !skills.cwd) {
     throw new Error(
-      "buildIsolatedOptions requires a skills session ({ cwd, allowedSkillNames, skillOverrides }) — pass the " +
+      "buildIsolatedOptions requires a skills session ({ cwd, configDir, allowedSkillNames, skillOverrides }) — pass the " +
         "result of host/agent/companion.js's _bindSkillsForRun() (built on buildSessionSkills())"
+    );
+  }
+  if (!skills.configDir) {
+    throw new Error(
+      "buildIsolatedOptions requires skills.configDir (this session's own isolated Claude Code CLI config " +
+        "directory, from buildSessionSkills()) — without it the SDK's bundled CLI subprocess falls back to the " +
+        "operator's real ~/.claude and writes session history there instead of this session's own workspace"
     );
   }
 
@@ -551,6 +565,13 @@ export function buildIsolatedOptions({
     ...(process.platform === "win32" ? { SystemRoot: process.env.SystemRoot || "" } : {}),
     ANTHROPIC_BASE_URL: snapshot.env.ANTHROPIC_BASE_URL,
     ANTHROPIC_API_KEY: snapshot.env.ANTHROPIC_API_KEY,
+    // This session's own isolated Claude Code CLI config directory (never
+    // the operator's real ~/.claude) — see skills.configDir's docstring
+    // above and this change's Part A evidence report for the reproduced
+    // leak this closes. Placed before `...extraEnv` so an explicit test
+    // double can still override it, exactly like every other fixed entry
+    // here.
+    CLAUDE_CONFIG_DIR: skills.configDir,
     ...extraEnv
   };
 

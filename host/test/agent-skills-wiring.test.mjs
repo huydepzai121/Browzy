@@ -160,6 +160,22 @@ await test("buildIsolatedOptions throws when no skills session is provided — a
   assert(/skills/i.test(threw.message), `error should mention the missing skills session: ${threw.message}`);
 });
 
+await test("buildIsolatedOptions throws when skills.configDir is missing — a run can never silently reach query() without an isolated CLAUDE_CONFIG_DIR", async () => {
+  let threw = null;
+  try {
+    buildIsolatedOptions({
+      mcpServer: {},
+      serverName: "srv",
+      snapshot: { model: "m", env: { ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "https://x" } },
+      skills: { cwd: "/scratch/conv-1", allowedSkillNames: [], skillOverrides: {} }
+    });
+  } catch (err) {
+    threw = err;
+  }
+  assert(threw, "expected buildIsolatedOptions to throw without skills.configDir");
+  assert(/configDir/.test(threw.message), `error should mention the missing configDir: ${threw.message}`);
+});
+
 await test("buildIsolatedOptions composes cwd/skills/skillOverrides and adds the Skill tool, without weakening the isolated baseline", async () => {
   const options = buildIsolatedOptions({
     mcpServer: { fake: "server" },
@@ -168,10 +184,16 @@ await test("buildIsolatedOptions composes cwd/skills/skillOverrides and adds the
     abortController: new AbortController(),
     skills: {
       cwd: "/scratch/conv-1",
+      configDir: "/scratch/conv-1/claude-config",
       allowedSkillNames: ["alpha", "beta"],
       skillOverrides: { alpha: "on", beta: "user-invocable-only" }
     }
   });
+
+  assert(
+    options.env.CLAUDE_CONFIG_DIR === "/scratch/conv-1/claude-config",
+    `options.env.CLAUDE_CONFIG_DIR must be this session's own isolated config dir, not the operator's real ~/.claude — got ${options.env.CLAUDE_CONFIG_DIR}`
+  );
 
   assert(options.cwd === "/scratch/conv-1", "cwd must be the session workspace directory");
   assertDeepEqual(options.skills, ["alpha", "beta"], "options.skills must be the exact allowedSkillNames allowlist");

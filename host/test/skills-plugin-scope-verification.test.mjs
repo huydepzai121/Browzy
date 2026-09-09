@@ -209,6 +209,7 @@ async function main() {
       skills: {
         cwd: workspaceDir,
         pluginDir: built.pluginDir,
+        configDir: built.configDir,
         allowedSkillNames: [...built.allowedSkillNames, `${SESSION_SKILLS_PLUGIN_NAME}:${parentSentinelName}`],
         skillOverrides: built.skillOverrides
       }

@@ -101,7 +101,12 @@ function fakeSnapshot() {
   return { model: "claude-x", env: { ANTHROPIC_API_KEY: "k", ANTHROPIC_BASE_URL: "https://x" } };
 }
 function fakeSkills() {
-  return { cwd: "/scratch/conv-perm-preapproval", allowedSkillNames: [], skillOverrides: {} };
+  return {
+    cwd: "/scratch/conv-perm-preapproval",
+    configDir: "/scratch/conv-perm-preapproval/claude-config",
+    allowedSkillNames: [],
+    skillOverrides: {}
+  };
 }
 
 console.log("\nSDK tool preapproval — every browser tool must be in the allowlist alongside Skill\n");
