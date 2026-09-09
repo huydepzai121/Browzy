@@ -40,3 +40,6 @@ build/
 
 # Manually exported Web Store package (package-extension.sh writes to build/)
 extension.zip
+
+# Local Claude Code session state (agent memory, local settings, local skills).
+.claude/
