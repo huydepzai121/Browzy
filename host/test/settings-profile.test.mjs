@@ -176,6 +176,40 @@ await check("snapshotForRun returns the exact contract shape with the requested 
   assert(Object.keys(snapshot.env).sort().join(",") === "ANTHROPIC_API_KEY,ANTHROPIC_BASE_URL", Object.keys(snapshot.env).join(","));
 });
 
+await check("snapshotForRun's credentialRevision reflects the credential's own revision counter — non-secret, distinct from the whole-profile revision (tasks.md 2.1)", async () => {
+  useScratchConfigDir();
+  await profile.saveProfile({
+    profileId: TEST_PROFILE_ID,
+    baseUrl: "https://api.anthropic.com",
+    models: [{ id: "claude-a", label: "A" }],
+    defaultModelId: "claude-a"
+  });
+  await profile.setCredential(TEST_PROFILE_ID, "sk-test-key-cred-rev-1", { memoryOnly: true });
+  const first = await profile.snapshotForRun(TEST_PROFILE_ID);
+  assert(typeof first.credentialRevision === "number", `credentialRevision must be a number, got ${JSON.stringify(first.credentialRevision)}`);
+  assert(first.credentialRevision === 1, `first credential set must be revision 1, got ${first.credentialRevision}`);
+
+  // A non-credential edit (saveProfile) bumps the whole-profile `revision`
+  // but must NOT bump `credentialRevision` — they are distinct counters.
+  await profile.saveProfile({
+    profileId: TEST_PROFILE_ID,
+    baseUrl: "https://api.anthropic.com",
+    models: [
+      { id: "claude-a", label: "A" },
+      { id: "claude-b", label: "B" }
+    ],
+    defaultModelId: "claude-a"
+  });
+  const afterProfileEdit = await profile.snapshotForRun(TEST_PROFILE_ID);
+  assert(afterProfileEdit.credentialRevision === 1, `an unrelated profile edit must not bump credentialRevision, got ${afterProfileEdit.credentialRevision}`);
+  assert(afterProfileEdit.revision > first.revision, "the unrelated profile edit DOES bump the whole-profile revision — the two counters are independent");
+
+  // Replacing the credential bumps credentialRevision.
+  await profile.setCredential(TEST_PROFILE_ID, "sk-test-key-cred-rev-2", { memoryOnly: true });
+  const afterCredentialReplace = await profile.snapshotForRun(TEST_PROFILE_ID);
+  assert(afterCredentialReplace.credentialRevision === 2, `replacing the credential must bump credentialRevision, got ${afterCredentialReplace.credentialRevision}`);
+});
+
 await check("snapshotForRun falls back to the profile's default model when none is requested", async () => {
   useScratchConfigDir();
   await profile.saveProfile({ profileId: TEST_PROFILE_ID, baseUrl: "https://api.anthropic.com", models: [{ id: "claude-a", label: "A" }], defaultModelId: "claude-a" });

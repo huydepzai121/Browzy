@@ -12,6 +12,7 @@ import crypto from "node:crypto";
 import { Run, RUN_STATES } from "./run.js";
 import { PendingRecordingsStore } from "../storage/pending-recordings.js";
 import { sanitizeActionEvent, PerStreamSeqTracker } from "../storage/action-timeline.js";
+import { migrateConversationMetadata } from "../storage/conversation-metadata.js";
 
 export function newConversationId() {
   return `conv_${crypto.randomBytes(9).toString("hex")}`;
@@ -200,6 +201,55 @@ export class SessionManager {
   setSkillsBinding(conversationId, binding) {
     if (this._deletedConversations.has(conversationId)) return; // see this._deletedConversations' header comment
     this.store.updateMeta(conversationId, { skillsBinding: binding });
+  }
+
+  /**
+   * The versioned conversation metadata envelope (tasks.md 2.1 / design.md
+   * decision 2), migrating a legacy or missing record to the current schema
+   * on first read and persisting that result so later reads are cheap and
+   * stable (host/agent/storage/conversation-metadata.js's own migration
+   * contract: never reconstructs `appProfile` from a legacy record).
+   *
+   * @param {string} conversationId
+   * @returns {object|null} null for an unknown/deleted conversation
+   */
+  getConversationMetadata(conversationId) {
+    const meta = this.store.loadMeta(conversationId);
+    if (!meta) return null;
+    const migrated = migrateConversationMetadata(meta);
+    // migrateConversationMetadata() returns the SAME reference when no
+    // migration was needed (see its own docstring) — only write when it
+    // actually built a new envelope, so a hot read path never triggers a
+    // redundant disk write.
+    if (migrated !== (meta.conversationMetadata || null) && !this._deletedConversations.has(conversationId)) {
+      this.store.updateMeta(conversationId, { conversationMetadata: migrated });
+    }
+    return migrated;
+  }
+
+  /**
+   * Bind this run's app-immutable identity (secret-free profile identity,
+   * session-schema identity, permission-policy identity — tasks.md 2.1/2.2)
+   * into the conversation's metadata envelope, ONCE. A later run's call is a
+   * no-op for these three fields — mirrors setSkillsBinding's own "bound on
+   * first run, reused verbatim afterward" contract, so a mid-conversation
+   * profile/skill change never silently rewrites an already-bound
+   * conversation's recorded identity (that comparison/rejection is 2.4's
+   * job, not this method's).
+   *
+   * @param {string} conversationId
+   * @param {{appProfile: object, sessionSchemaIdentity: object|null, permissionPolicy: object|null}} snapshot
+   * @returns {object|null} the resulting (possibly unchanged) envelope, or
+   *   null for an unknown/deleted conversation
+   */
+  bindConversationAppSnapshot(conversationId, { appProfile, sessionSchemaIdentity, permissionPolicy }) {
+    const current = this.getConversationMetadata(conversationId);
+    if (!current) return null;
+    if (current.appProfile) return current; // already bound; never overwritten
+    if (this._deletedConversations.has(conversationId)) return current; // see this._deletedConversations' header comment
+    const next = { ...current, appProfile, sessionSchemaIdentity, permissionPolicy };
+    this.store.updateMeta(conversationId, { conversationMetadata: next });
+    return next;
   }
 
   /**

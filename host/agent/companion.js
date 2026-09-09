@@ -49,6 +49,7 @@ import {
 import { TranscriptStore } from "./storage/transcript-store.js";
 import { PendingRecordingsStore } from "./storage/pending-recordings.js";
 import { ActionArtifactStore } from "./storage/action-timeline.js";
+import { buildAppProfileIdentity, buildSessionSchemaIdentity, buildPermissionPolicyIdentity } from "./storage/conversation-metadata.js";
 import {
   conversationAttachmentsDir,
   conversationDir,
@@ -1406,6 +1407,32 @@ export class CompanionCore {
       run.stop("options_build_failed");
       this.sessionManager.finishRun(conversationId);
       return;
+    }
+
+    // Tasks 2.1/2.2: bind this run's app-immutable identity (secret-free
+    // profile identity, session-schema identity, permission-policy
+    // identity) into the conversation's versioned metadata envelope, once.
+    // Derived from `snapshot`/`skills`/`options` — the SAME values just used
+    // to build this run — never from a separate re-resolution, so it can
+    // never disagree with what the run actually got. Only `ANTHROPIC_BASE_URL`
+    // is read out of `snapshot.env`; `ANTHROPIC_API_KEY` never reaches this
+    // call. Best-effort: a failure here must never block or fail an
+    // otherwise-valid run over bookkeeping (mirrors the borrowed-tab
+    // authorization try/catch above).
+    try {
+      this.sessionManager.bindConversationAppSnapshot(conversationId, {
+        appProfile: buildAppProfileIdentity({
+          profileId,
+          baseUrl: snapshot.env.ANTHROPIC_BASE_URL,
+          modelId: snapshot.model,
+          credentialRevision: snapshot.credentialRevision ?? null
+        }),
+        sessionSchemaIdentity: buildSessionSchemaIdentity(skills),
+        permissionPolicy: buildPermissionPolicyIdentity(options)
+      });
+    } catch {
+      // Never block a run over this — see the borrowed-tab authorization
+      // note above for the identical rationale.
     }
 
     await this._runQuery(run, queryPrompt, options, attachments);

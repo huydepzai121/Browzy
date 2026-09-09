@@ -179,7 +179,7 @@ export function _clearCredentialRevokedListenersForTests() {
  *
  * @param {string} profileId
  * @param {string} [modelId] defaults to the profile's default model
- * @returns {Promise<{ model: string, env: { ANTHROPIC_BASE_URL: string, ANTHROPIC_API_KEY: string }, revision: number, profileId: string }>}
+ * @returns {Promise<{ model: string, env: { ANTHROPIC_BASE_URL: string, ANTHROPIC_API_KEY: string }, revision: number, profileId: string, credentialRevision: number }>}
  * @throws {ProviderError} code NO_CREDENTIAL if no credential is available.
  */
 export async function snapshotForRun(profileId, modelId) {
@@ -209,7 +209,15 @@ export async function snapshotForRun(profileId, modelId) {
       ANTHROPIC_API_KEY: apiKey
     },
     revision: profile.revision,
-    profileId
+    profileId,
+    // Additive (tasks.md 2.1's "secret-free app profile identity ...
+    // credential revision"): the credential's OWN revision counter (bumped
+    // only by setCredential/removeCredential — see loadProfile()'s identical
+    // field above), distinct from `revision` (the whole profile record's,
+    // bumped by ANY edit including baseUrl/model-list changes). Never the
+    // secret itself — this is the non-secret counter a resume-compatibility
+    // check (tasks.md 2.4) can compare against without ever reading `env`.
+    credentialRevision: profile.credentialRevision || 0
   };
 }
 

@@ -23,6 +23,7 @@ import {
   ensureDir,
   assertSafeId
 } from "./paths.js";
+import { initConversationMetadataEnvelope } from "./conversation-metadata.js";
 
 function atomicWriteJson(file, obj) {
   ensureDir(path.dirname(file));
@@ -62,6 +63,14 @@ export class TranscriptStore {
       updatedAt: now,
       lastSeq: 0,
       interrupted: false,
+      // tasks.md 2.1: every conversation record carries the versioned
+      // conversationMetadata envelope from creation, including the
+      // appendEvent() auto-vivify path just above (which calls
+      // createConversation(conversationId) with no meta) — so a conversation
+      // can never exist on disk without this field going forward. An
+      // explicit `meta.conversationMetadata` (uncommon) still wins via the
+      // spread below, same as every other default field here.
+      conversationMetadata: initConversationMetadataEnvelope(),
       ...meta
     };
     atomicWriteJson(conversationMetaFile(conversationId), record);

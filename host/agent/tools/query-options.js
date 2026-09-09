@@ -708,7 +708,22 @@ export function buildIsolatedOptions({
     // Only set when a page context is actually bound — a run with none gets
     // no systemPrompt option at all, byte-identical to this channel's
     // absence (see "Bound page-context channel" above).
-    ...(systemPromptText ? { systemPrompt: { type: "custom", prompt: systemPromptText } } : {}),
+    //
+    // `snapshot: false` is EXPLICIT, not merely the SDK's own default
+    // (tasks.md 2.2 / design.md decision 2: "must not freeze a prior custom
+    // system prompt"). sdk.d.ts's own `systemPrompt.snapshot` docstring
+    // (~2192-2220): when true, "the conversation's system prompt is
+    // recorded once ... and reused verbatim on every later request and
+    // resume/continue, instead of being rendered fresh each time." This
+    // run's systemPrompt text embeds the CURRENT bound page/document
+    // context (renderPageContextSystemPrompt above) — recording it would
+    // freeze a stale page identity across every future resumed turn, the
+    // exact failure this decision forbids. Pinning `false` explicitly (
+    // rather than relying on omission, which is today's default but is
+    // itself described as "rolling out" and account-dependent) makes this
+    // an intentional, tested contract instead of an incidental default that
+    // a future SDK bump could silently flip.
+    ...(systemPromptText ? { systemPrompt: { type: "custom", prompt: systemPromptText, snapshot: false } } : {}),
     // Only set when the panel actually chose a level. Absent means the run
     // sends no effort parameter and the model's own default applies — which
     // is deliberately not the same as pinning it to whatever that default is
